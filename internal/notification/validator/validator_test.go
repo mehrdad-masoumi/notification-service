@@ -9,8 +9,16 @@ import (
 	notificationvalidator "notification-service/internal/notification/validator"
 )
 
+var allEnabled = map[string]bool{
+	"in_app":   true,
+	"email":    true,
+	"sms":      true,
+	"whatsapp": true,
+	"push":     true,
+}
+
 func TestValidateAdminCreate_OK(t *testing.T) {
-	v := notificationvalidator.New()
+	v := notificationvalidator.New(allEnabled)
 	fields, err := v.ValidateAdminCreate(notificationdto.AdminCreateRequest{
 		Title:    "Hello",
 		Message:  "World",
@@ -23,7 +31,7 @@ func TestValidateAdminCreate_OK(t *testing.T) {
 }
 
 func TestValidateAdminCreate_MissingFields(t *testing.T) {
-	v := notificationvalidator.New()
+	v := notificationvalidator.New(allEnabled)
 	fields, err := v.ValidateAdminCreate(notificationdto.AdminCreateRequest{})
 	require.Error(t, err)
 	require.Contains(t, fields, "title")
@@ -33,7 +41,7 @@ func TestValidateAdminCreate_MissingFields(t *testing.T) {
 }
 
 func TestValidateInternalCreate_RequiresIdempotencyKey(t *testing.T) {
-	v := notificationvalidator.New()
+	v := notificationvalidator.New(allEnabled)
 	fields, err := v.ValidateInternalCreate(notificationdto.InternalCreateRequest{
 		UserID:   "11111111-1111-1111-1111-111111111111",
 		Title:    "t",
@@ -45,7 +53,7 @@ func TestValidateInternalCreate_RequiresIdempotencyKey(t *testing.T) {
 }
 
 func TestValidateChannels_Invalid(t *testing.T) {
-	v := notificationvalidator.New()
+	v := notificationvalidator.New(allEnabled)
 	fields, err := v.ValidateAdminCreate(notificationdto.AdminCreateRequest{
 		Title:    "t",
 		Message:  "m",
@@ -54,4 +62,85 @@ func TestValidateChannels_Invalid(t *testing.T) {
 	})
 	require.Error(t, err)
 	require.Contains(t, fields, "channels[0]")
+}
+
+func TestValidateChannels_DisabledByConfig(t *testing.T) {
+	v := notificationvalidator.New(map[string]bool{"in_app": true, "email": true})
+	fields, err := v.ValidateAdminCreate(notificationdto.AdminCreateRequest{
+		Title:    "t",
+		Message:  "m",
+		UserIDs:  []string{"11111111-1111-1111-1111-111111111111"},
+		Channels: []string{"sms"},
+	})
+	require.Error(t, err)
+	require.Contains(t, fields, "channels[0]")
+}
+
+func TestValidateCommand_TemplateCodeRequired(t *testing.T) {
+	v := notificationvalidator.New(allEnabled)
+	fields, err := v.ValidateCommand(notificationdto.CommandRequest{
+		IdempotencyKey: "key-1",
+		UserID:         "11111111-1111-1111-1111-111111111111",
+	})
+	require.Error(t, err)
+	require.Contains(t, fields, "template_code")
+}
+
+func TestValidateCommand_ChannelsOptional(t *testing.T) {
+	v := notificationvalidator.New(allEnabled)
+	fields, err := v.ValidateCommand(notificationdto.CommandRequest{
+		IdempotencyKey: "key-1",
+		UserID:         "11111111-1111-1111-1111-111111111111",
+		TemplateCode:   "withdrawal_approved",
+	})
+	require.NoError(t, err)
+	require.Nil(t, fields)
+}
+
+func TestValidateCommand_InvalidChannelWhenProvided(t *testing.T) {
+	v := notificationvalidator.New(map[string]bool{"in_app": true})
+	fields, err := v.ValidateCommand(notificationdto.CommandRequest{
+		IdempotencyKey: "key-1",
+		UserID:         "11111111-1111-1111-1111-111111111111",
+		TemplateCode:   "withdrawal_approved",
+		Channels:       []string{"sms"},
+	})
+	require.Error(t, err)
+	require.Contains(t, fields, "channels[0]")
+}
+
+func TestValidateDirectCommand_OK(t *testing.T) {
+	v := notificationvalidator.New(allEnabled)
+	fields, err := v.ValidateDirectCommand(notificationdto.DirectCommandRequest{
+		IdempotencyKey: "key-1",
+		TemplateCode:   "login_otp",
+		Channel:        "email",
+		Recipient:      "user@example.com",
+	})
+	require.NoError(t, err)
+	require.Nil(t, fields)
+}
+
+func TestValidateDirectCommand_InvalidEmail(t *testing.T) {
+	v := notificationvalidator.New(allEnabled)
+	fields, err := v.ValidateDirectCommand(notificationdto.DirectCommandRequest{
+		IdempotencyKey: "key-1",
+		TemplateCode:   "login_otp",
+		Channel:        "email",
+		Recipient:      "not-an-email",
+	})
+	require.Error(t, err)
+	require.Contains(t, fields, "recipient")
+}
+
+func TestValidateDirectCommand_DisabledChannel(t *testing.T) {
+	v := notificationvalidator.New(map[string]bool{"in_app": true})
+	fields, err := v.ValidateDirectCommand(notificationdto.DirectCommandRequest{
+		IdempotencyKey: "key-1",
+		TemplateCode:   "login_otp",
+		Channel:        "sms",
+		Recipient:      "+989120000000",
+	})
+	require.Error(t, err)
+	require.Contains(t, fields, "channel")
 }

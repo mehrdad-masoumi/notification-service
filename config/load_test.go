@@ -12,14 +12,14 @@ import (
 
 func TestEnvKeyMapper(t *testing.T) {
 	cases := map[string]string{
-		"NOTIFICATION_AUTH__ACCESS_SECRET":              "auth.access_secret",
-		"NOTIFICATION_INTERNAL_API_KEY":                 "internal_api_key",
-		"NOTIFICATION_WORKER__MAX_RETRIES":              "worker.max_retries",
-		"NOTIFICATION_USER_SERVICE__BASE_URL":           "user_service.base_url",
-		"NOTIFICATION_APPLICATION__HTTP_SERVER__PORT":   "application.http_server.port",
-		"NOTIFICATION_APPLICATION__ENV":                 "application.env",
-		"NOTIFICATION_POSTGRES__HOST":                   "postgres.host",
-		"NOTIFICATION_OUTBOX__POLL_INTERVAL_MS":         "outbox.poll_interval_ms",
+		"NOTIFICATION_AUTH__ACCESS_SECRET":                        "auth.access_secret",
+		"NOTIFICATION_INTERNAL_API_KEY":                           "internal_api_key",
+		"NOTIFICATION_WORKER__MAX_RETRIES":                        "worker.max_retries",
+		"NOTIFICATION_USER_SERVICE__BASE_URL":                     "user_service.base_url",
+		"NOTIFICATION_APPLICATION__HTTP_SERVER__PORT":             "application.http_server.port",
+		"NOTIFICATION_APPLICATION__ENV":                           "application.env",
+		"NOTIFICATION_POSTGRES__HOST":                             "postgres.host",
+		"NOTIFICATION_OUTBOX__POLL_INTERVAL_MS":                   "outbox.poll_interval_ms",
 		"NOTIFICATION_DIRECT_NOTIFICATION__RATE_LIMIT_PER_MINUTE": "direct_notification.rate_limit_per_minute",
 	}
 	for in, want := range cases {

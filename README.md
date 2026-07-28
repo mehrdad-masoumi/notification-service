@@ -4,32 +4,50 @@ Stateless microservice for multi-channel notifications (In-App, Email, SMS, What
 
 ## Architecture
 
+Commands are accepted by the API and persisted transactionally (notification + deliveries +
+outbox row) — the API never talks to RabbitMQ directly. A separate **outbox publisher**
+process claims pending outbox rows (`FOR UPDATE SKIP LOCKED`) and publishes them to RabbitMQ
+with publisher confirms, so a crash between DB commit and publish can never lose a message.
+
 ```text
 Client / Admin / Internal Services
         ↓
-Notification API  (202 Accepted)
+Notification API  (validate → idempotency claim → resolve contacts → render template → 202 Accepted)
         ↓
-Postgres + RabbitMQ priority queues
+Postgres: notifications + deliveries + notification_outbox   (single transaction)
         ↓
-Workers (high / normal / low)
+Outbox publisher (cmd/outbox): claim → publish w/ confirms → mark published/failed (backoff)
+        ↓
+RabbitMQ priority queues
+        ↓
+Workers (high / normal / low): atomic delivery claim → render per-channel → send
         ↓
 Providers (email / sms / whatsapp / inapp / push)
 ```
+
+Templates (`notification_templates`) hold per-channel/locale subject+body with `{{var}}`
+placeholders; content is rendered at accept-time (dry run, to catch missing variables early)
+and again per-channel at send-time. A scheduler promotes due `scheduled` notifications to
+`pending` and writes their outbox rows atomically.
 
 Queues: `notification.high`, `notification.normal`, `notification.low` (+ matching `.dlq`).
 
 ## Layout
 
 ```text
-cmd/api                 HTTP API + scheduler
-cmd/worker              Queue consumers + health/metrics
-internal/notification   domain (http/service/repo/validator/dto/entity/metrics)
-internal/provider       channel adapters
-internal/queue          RabbitMQ (notification topology)
-pkg/sharederrors        domain sentinel errors (ErrNotFound, …)
-infra/grafana           Grafana dashboard
-infra/prometheus        Alert rules
-migrations/postgres     sql-migrate
+cmd/api                     HTTP API + scheduler + cleanup loop
+cmd/worker                  Queue consumers + health/metrics
+cmd/outbox                  Outbox publisher (claim → publish w/ confirms) + health/metrics
+internal/notification       domain (http/service/repo/validator/dto/entity/metrics)
+internal/notification/template  safe {{var}} renderer (no code execution)
+internal/outbox             outbox publisher service used by cmd/outbox
+internal/userclient         HTTP client resolving user contacts (email/phone/locale/prefs)
+internal/provider           channel adapters
+internal/queue              RabbitMQ (topology, publisher confirms, PublishWithConfirm)
+pkg/sharederrors            domain sentinel errors (ErrNotFound, …)
+infra/grafana               Grafana dashboard
+infra/prometheus            Alert rules
+migrations/postgres         sql-migrate
 ```
 
 Shared cross-service libs live in `../go-packages` (`apperr`, `httpserver`, `auth`, `db`).
@@ -41,6 +59,11 @@ Shared cross-service libs live in `../go-packages` (`apperr`, `httpserver`, `aut
 - `POST /admin/notifications` → `202`
 - `GET /admin/notifications`
 - `GET /admin/notifications/:id`
+- `GET /admin/notification-batches/:batch_id` — batch header + member deliveries
+- `POST /admin/notification-templates`
+- `GET /admin/notification-templates` / `GET /admin/notification-templates/:id`
+- `PUT /admin/notification-templates/:id`
+- `PATCH /admin/notification-templates/:id/status` — enable/disable
 
 ### User (JWT; `user_id` from token only)
 
@@ -51,7 +74,13 @@ Shared cross-service libs live in `../go-packages` (`apperr`, `httpserver`, `aut
 
 ### Internal (header `X-Internal-Api-Key`)
 
-- `POST /internal/notifications` (requires `idempotency_key`)
+- `POST /internal/v1/notifications` — template-driven command (`template_code`, resolves
+  user contacts/preferences, renders content, `idempotency_key` required)
+- `POST /internal/v1/direct-notifications` — single channel + explicit recipient, no
+  `user_id`/contacts lookup
+- `POST /internal/notifications` — **deprecated**, kept for backward compatibility (still
+  requires `idempotency_key`); writes to the outbox like the v1 endpoints instead of
+  publishing to RabbitMQ directly
 
 ### Health & metrics
 
@@ -138,6 +167,7 @@ cp .env.example .env
 go mod tidy
 go run ./cmd/api
 go run ./cmd/worker -queues=high,normal,low
+go run ./cmd/outbox
 ```
 
 ## Docker
@@ -170,9 +200,12 @@ go test ./...
 
 Main coverage:
 
-- Validator (required fields, channels, idempotency key)
+- Validator (required fields, channels, idempotency key, command/direct command)
 - Service validation paths
-- Provider error classification (temporary vs permanent)
+- Template renderer (`{{var}}` substitution, missing variables, no code execution)
+- Outbox backoff/retry delay calculation
+- Provider error classification (temporary vs permanent, disabled = permanent)
+- Provider registry `Ready()` gating (sms/whatsapp/push only registered when configured)
 - In-App provider send
 
 ## Config

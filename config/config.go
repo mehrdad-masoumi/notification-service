@@ -158,16 +158,16 @@ type Scheduler struct {
 }
 
 type Outbox struct {
-	BatchSize           int `koanf:"batch_size"`
-	PollIntervalMS      int `koanf:"poll_interval_ms"`
-	LockTimeoutSeconds  int `koanf:"lock_timeout_seconds"`
-	HealthPort          string `koanf:"health_port"`
-	MaxAttempts         int `koanf:"max_attempts"`
+	BatchSize          int    `koanf:"batch_size"`
+	PollIntervalMS     int    `koanf:"poll_interval_ms"`
+	LockTimeoutSeconds int    `koanf:"lock_timeout_seconds"`
+	HealthPort         string `koanf:"health_port"`
+	MaxAttempts        int    `koanf:"max_attempts"`
 }
 
 type Retention struct {
-	OutboxDays       int `koanf:"outbox_days"`
-	IdempotencyHours int `koanf:"idempotency_hours"`
+	OutboxDays             int `koanf:"outbox_days"`
+	IdempotencyHours       int `koanf:"idempotency_hours"`
 	CleanupIntervalMinutes int `koanf:"cleanup_interval_minutes"`
 }
 

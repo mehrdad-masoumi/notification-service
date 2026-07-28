@@ -16,25 +16,339 @@ import (
 	"notification-service/internal/notification/entity"
 	notificationmetrics "notification-service/internal/notification/metrics"
 	notificationrepo "notification-service/internal/notification/repository"
+	notificationtemplate "notification-service/internal/notification/template"
 	notificationvalidator "notification-service/internal/notification/validator"
+	providerrerrors "notification-service/internal/provider"
 	"notification-service/pkg/sharederrors"
 
 	"github.com/mehrdad-masoumi/go-packages/apperr"
 )
 
+// channelPriorityOrder decides which channel's template is used to fill
+// the notification's legacy single title/message columns (used for
+// admin/user display); per-channel bodies are re-rendered by the worker at
+// send time from template_code + locale + variables.
+var channelPriorityOrder = []entity.Channel{
+	entity.ChannelInApp,
+	entity.ChannelEmail,
+	entity.ChannelSMS,
+	entity.ChannelWhatsApp,
+	entity.ChannelPush,
+}
+
 type Service struct {
 	repo      *notificationrepo.Repository
 	validator notificationvalidator.Validator
-	publisher notificationcontract.IFPublisher
+	users     notificationcontract.IFUserContacts
 }
 
 func New(
 	repo *notificationrepo.Repository,
 	validator notificationvalidator.Validator,
-	publisher notificationcontract.IFPublisher,
+	users notificationcontract.IFUserContacts,
 ) *Service {
-	return &Service{repo: repo, validator: validator, publisher: publisher}
+	return &Service{repo: repo, validator: validator, users: users}
 }
+
+func (s *Service) Repo() *notificationrepo.Repository {
+	return s.repo
+}
+
+// ---------------------------------------------------------------------
+// v1 template-driven commands
+// ---------------------------------------------------------------------
+
+// AcceptCommand implements the v1 template-driven notification command.
+// It never publishes to RabbitMQ directly: notification + deliveries +
+// outbox rows are written in one DB transaction, and a separate outbox
+// publisher process delivers them to the broker.
+func (s *Service) AcceptCommand(ctx context.Context, req notificationdto.CommandRequest) (notificationdto.AcceptedResponse, int, error) {
+	const op = "notification_service.AcceptCommand"
+
+	if fields, err := s.validator.ValidateCommand(req); err != nil {
+		return notificationdto.AcceptedResponse{}, http.StatusUnprocessableEntity, &apperr.Error{Fields: fields}
+	}
+
+	locale := req.Locale
+	if locale == "" {
+		locale = entity.DefaultLocale
+	}
+
+	hash := hashJSON(req)
+	rec, outcome, err := s.repo.ClaimIdempotency(ctx, req.IdempotencyKey, op, hash)
+	if err != nil {
+		return notificationdto.AcceptedResponse{}, http.StatusInternalServerError, apperr.New(op).WithKind(apperr.KindUnexpected).WithErr(err)
+	}
+	if resp, code, done, err := s.handleClaimOutcome(rec, outcome, op); done {
+		return resp, code, err
+	}
+
+	userID, err := uuid.Parse(req.UserID)
+	if err != nil {
+		_ = s.repo.FailIdempotency(ctx, req.IdempotencyKey)
+		return notificationdto.AcceptedResponse{}, http.StatusBadRequest, apperr.New(op).WithKind(apperr.KindInvalid).WithMessage("invalid user_id")
+	}
+
+	contacts, err := s.users.ResolveContacts(ctx, req.UserID)
+	if err != nil {
+		_ = s.repo.FailIdempotency(ctx, req.IdempotencyKey)
+		notificationmetrics.IncError("resolve_contacts")
+		if providerrerrors.IsPermanent(err) {
+			// User-service 404 is permanent and must not be retried.
+			return notificationdto.AcceptedResponse{}, http.StatusNotFound, apperr.New(op).
+				WithKind(apperr.KindNotFound).
+				WithErr(err).
+				WithMessage("user not found")
+		}
+		return notificationdto.AcceptedResponse{}, http.StatusServiceUnavailable, apperr.New(op).
+			WithKind(apperr.KindUnexpected).
+			WithErr(err).
+			WithMessage("failed to resolve user contacts")
+	}
+
+	channels := toChannels(req.Channels)
+	if len(channels) == 0 {
+		codes, err := s.repo.ListEnabledChannelsForCode(ctx, req.TemplateCode)
+		if err != nil {
+			_ = s.repo.FailIdempotency(ctx, req.IdempotencyKey)
+			return notificationdto.AcceptedResponse{}, http.StatusInternalServerError, apperr.New(op).WithKind(apperr.KindUnexpected).WithErr(err)
+		}
+		channels = toChannels(codes)
+	}
+	if len(channels) == 0 {
+		_ = s.repo.FailIdempotency(ctx, req.IdempotencyKey)
+		return notificationdto.AcceptedResponse{}, http.StatusUnprocessableEntity, &apperr.Error{Fields: map[string]string{"template_code": "validation.notfound.template_code"}}
+	}
+
+	channels = filterChannelsByContacts(channels, contacts)
+	if len(channels) == 0 {
+		_ = s.repo.FailIdempotency(ctx, req.IdempotencyKey)
+		return notificationdto.AcceptedResponse{}, http.StatusUnprocessableEntity, &apperr.Error{Fields: map[string]string{"channels": "validation.norecipient.channels"}}
+	}
+
+	templates, channels, err := s.loadTemplatesForChannels(ctx, req.TemplateCode, locale, channels)
+	if err != nil {
+		_ = s.repo.FailIdempotency(ctx, req.IdempotencyKey)
+		return notificationdto.AcceptedResponse{}, http.StatusInternalServerError, apperr.New(op).WithKind(apperr.KindUnexpected).WithErr(err)
+	}
+	if len(channels) == 0 {
+		_ = s.repo.FailIdempotency(ctx, req.IdempotencyKey)
+		return notificationdto.AcceptedResponse{}, http.StatusUnprocessableEntity, &apperr.Error{Fields: map[string]string{"template_code": "validation.notfound.template"}}
+	}
+
+	if fields := validateTemplateVariables(templates, req.Variables); len(fields) > 0 {
+		_ = s.repo.FailIdempotency(ctx, req.IdempotencyKey)
+		return notificationdto.AcceptedResponse{}, http.StatusUnprocessableEntity, &apperr.Error{Fields: fields}
+	}
+
+	priority := resolvePriority(req.Priority, templates)
+	title, message := primaryTitleMessage(templates, req.Variables, req.TemplateCode)
+
+	variablesJSON, err := json.Marshal(req.Variables)
+	if err != nil {
+		_ = s.repo.FailIdempotency(ctx, req.IdempotencyKey)
+		return notificationdto.AcceptedResponse{}, http.StatusBadRequest, apperr.New(op).WithKind(apperr.KindInvalid).WithMessage("invalid variables")
+	}
+
+	var actionURL *string
+	if req.ActionURL != "" {
+		actionURL = &req.ActionURL
+	}
+	templateCode := req.TemplateCode
+
+	now := time.Now().UTC()
+	status := entity.StatusPending
+	scheduled := false
+	if req.ScheduledAt != nil && req.ScheduledAt.After(now) {
+		status = entity.StatusScheduled
+		scheduled = true
+	}
+
+	n := entity.Notification{
+		ID:           uuid.New(),
+		UserID:       userID,
+		Title:        title,
+		Message:      message,
+		Type:         "template",
+		Priority:     priority,
+		Payload:      json.RawMessage(`{}`),
+		ActionURL:    actionURL,
+		Status:       status,
+		Channels:     channels,
+		ScheduledAt:  req.ScheduledAt,
+		TemplateCode: &templateCode,
+		Locale:       locale,
+		Variables:    variablesJSON,
+	}
+	key := req.IdempotencyKey
+	n.IdempotencyKey = &key
+
+	deliveries := makeDeliveries(channels)
+	var outboxEvents []entity.OutboxEvent
+	if !scheduled {
+		outboxEvents, err = buildOutboxEvents(n.ID, priority, deliveries)
+		if err != nil {
+			_ = s.repo.FailIdempotency(ctx, req.IdempotencyKey)
+			return notificationdto.AcceptedResponse{}, http.StatusInternalServerError, apperr.New(op).WithKind(apperr.KindUnexpected).WithErr(err)
+		}
+	}
+
+	created, _, err := s.repo.CreateNotificationBundle(ctx, n, deliveries, outboxEvents)
+	if err != nil {
+		_ = s.repo.FailIdempotency(ctx, req.IdempotencyKey)
+		notificationmetrics.IncError("accept_command")
+		notificationmetrics.IncCommand("command", string(priority), "error")
+		return notificationdto.AcceptedResponse{}, http.StatusInternalServerError, apperr.New(op).WithKind(apperr.KindUnexpected).WithErr(err).WithMessage("failed to create notification")
+	}
+
+	resp := notificationdto.AcceptedResponse{ID: created.ID.String(), Status: "accepted"}
+	result := "accepted"
+	if scheduled {
+		resp.Status = "scheduled"
+		result = "scheduled"
+	}
+	code := http.StatusAccepted
+	_ = s.repo.CompleteIdempotency(ctx, req.IdempotencyKey, code, resp)
+	notificationmetrics.IncCommand("command", string(priority), result)
+	return resp, code, nil
+}
+
+// AcceptDirectCommand sends a single-channel notification to an explicit
+// recipient with no user lookup involved.
+func (s *Service) AcceptDirectCommand(ctx context.Context, req notificationdto.DirectCommandRequest) (notificationdto.AcceptedResponse, int, error) {
+	const op = "notification_service.AcceptDirectCommand"
+
+	if fields, err := s.validator.ValidateDirectCommand(req); err != nil {
+		return notificationdto.AcceptedResponse{}, http.StatusUnprocessableEntity, &apperr.Error{Fields: fields}
+	}
+
+	locale := req.Locale
+	if locale == "" {
+		locale = entity.DefaultLocale
+	}
+
+	hash := hashJSON(req)
+	rec, outcome, err := s.repo.ClaimIdempotency(ctx, req.IdempotencyKey, op, hash)
+	if err != nil {
+		return notificationdto.AcceptedResponse{}, http.StatusInternalServerError, apperr.New(op).WithKind(apperr.KindUnexpected).WithErr(err)
+	}
+	if resp, code, done, err := s.handleClaimOutcome(rec, outcome, op); done {
+		return resp, code, err
+	}
+
+	tmpl, err := s.repo.GetEnabledTemplate(ctx, req.TemplateCode, locale, req.Channel)
+	if err != nil {
+		_ = s.repo.FailIdempotency(ctx, req.IdempotencyKey)
+		if errors.Is(err, sharederrors.ErrNotFound) {
+			return notificationdto.AcceptedResponse{}, http.StatusUnprocessableEntity, &apperr.Error{Fields: map[string]string{"template_code": "validation.notfound.template"}}
+		}
+		return notificationdto.AcceptedResponse{}, http.StatusInternalServerError, apperr.New(op).WithKind(apperr.KindUnexpected).WithErr(err)
+	}
+
+	subject := ""
+	if tmpl.Subject != nil {
+		subject = *tmpl.Subject
+	}
+	if fields := validateTemplateVariables([]entity.Template{tmpl}, req.Variables); len(fields) > 0 {
+		_ = s.repo.FailIdempotency(ctx, req.IdempotencyKey)
+		notificationmetrics.IncTemplateRenderError(req.Channel)
+		return notificationdto.AcceptedResponse{}, http.StatusUnprocessableEntity, &apperr.Error{Fields: fields}
+	}
+	renderedSubject, renderedBody, _ := notificationtemplate.RenderPair(subject, tmpl.Body, req.Variables)
+
+	priority := entity.PriorityNormal
+	if req.Priority != "" {
+		priority = entity.Priority(req.Priority)
+	} else if tmpl.DefaultPriority != "" {
+		priority = tmpl.DefaultPriority
+	}
+
+	variablesJSON, err := json.Marshal(req.Variables)
+	if err != nil {
+		_ = s.repo.FailIdempotency(ctx, req.IdempotencyKey)
+		return notificationdto.AcceptedResponse{}, http.StatusBadRequest, apperr.New(op).WithKind(apperr.KindInvalid).WithMessage("invalid variables")
+	}
+
+	channel := entity.Channel(req.Channel)
+	templateCode := req.TemplateCode
+	key := req.IdempotencyKey
+
+	n := entity.Notification{
+		ID:             uuid.New(),
+		UserID:         uuid.Nil,
+		Title:          renderedSubject,
+		Message:        renderedBody,
+		Type:           "template_direct",
+		Priority:       priority,
+		Payload:        json.RawMessage(`{}`),
+		Status:         entity.StatusPending,
+		IdempotencyKey: &key,
+		Channels:       []entity.Channel{channel},
+		TemplateCode:   &templateCode,
+		Locale:         locale,
+		Variables:      variablesJSON,
+	}
+	switch channel {
+	case entity.ChannelEmail:
+		n.Email = &req.Recipient
+	case entity.ChannelSMS, entity.ChannelWhatsApp:
+		n.Phone = &req.Recipient
+	}
+
+	deliveries := makeDeliveries(n.Channels)
+	outboxEvents, err := buildOutboxEvents(n.ID, priority, deliveries)
+	if err != nil {
+		_ = s.repo.FailIdempotency(ctx, req.IdempotencyKey)
+		return notificationdto.AcceptedResponse{}, http.StatusInternalServerError, apperr.New(op).WithKind(apperr.KindUnexpected).WithErr(err)
+	}
+
+	created, _, err := s.repo.CreateNotificationBundle(ctx, n, deliveries, outboxEvents)
+	if err != nil {
+		_ = s.repo.FailIdempotency(ctx, req.IdempotencyKey)
+		notificationmetrics.IncError("accept_direct_command")
+		notificationmetrics.IncCommand("direct_command", string(priority), "error")
+		return notificationdto.AcceptedResponse{}, http.StatusInternalServerError, apperr.New(op).WithKind(apperr.KindUnexpected).WithErr(err).WithMessage("failed to create notification")
+	}
+
+	resp := notificationdto.AcceptedResponse{ID: created.ID.String(), Status: "accepted"}
+	code := http.StatusAccepted
+	_ = s.repo.CompleteIdempotency(ctx, req.IdempotencyKey, code, resp)
+	notificationmetrics.IncCommand("direct_command", string(priority), "accepted")
+	return resp, code, nil
+}
+
+// handleClaimOutcome interprets a ClaimIdempotency result. done=true means
+// the caller should return (resp, code, err) immediately without further
+// processing (replay / conflict / in-progress); done=false means the
+// caller acquired the claim and should proceed.
+func (s *Service) handleClaimOutcome(rec notificationrepo.IdempotencyRecord, outcome notificationrepo.ClaimOutcome, op string) (notificationdto.AcceptedResponse, int, bool, error) {
+	switch outcome {
+	case notificationrepo.ClaimAcquired:
+		return notificationdto.AcceptedResponse{}, 0, false, nil
+	case notificationrepo.ClaimReplay:
+		var resp notificationdto.AcceptedResponse
+		_ = json.Unmarshal(rec.ResponseBody, &resp)
+		code := rec.ResponseCode
+		if code == 0 {
+			code = http.StatusAccepted
+		}
+		return resp, code, true, nil
+	case notificationrepo.ClaimConflict:
+		notificationmetrics.IncIdempotencyConflict("hash_mismatch")
+		return notificationdto.AcceptedResponse{}, http.StatusConflict, true, apperr.New(op).
+			WithKind(apperr.KindInvalid).
+			WithMessage("idempotency key reused with a different request payload")
+	default: // ClaimInProgress
+		notificationmetrics.IncIdempotencyConflict("in_progress")
+		return notificationdto.AcceptedResponse{}, http.StatusConflict, true, apperr.New(op).
+			WithKind(apperr.KindInvalid).
+			WithMessage("request already processing")
+	}
+}
+
+// ---------------------------------------------------------------------
+// Deprecated free-text endpoints (kept working; now outbox-backed)
+// ---------------------------------------------------------------------
 
 func (s *Service) AdminCreate(ctx context.Context, req notificationdto.AdminCreateRequest, createdBy string) (notificationdto.AcceptedResponse, error) {
 	const op = "notification_service.AdminCreate"
@@ -116,19 +430,20 @@ func (s *Service) AdminCreate(ctx context.Context, req notificationdto.AdminCrea
 		}
 
 		deliveries := makeDeliveries(channels)
-		created, outDeliveries, err := s.repo.CreateNotificationWithDeliveries(ctx, n, deliveries)
+		var outboxEvents []entity.OutboxEvent
+		if !scheduled {
+			outboxEvents, err = buildOutboxEvents(n.ID, priority, deliveries)
+			if err != nil {
+				notificationmetrics.IncError("admin_create")
+				return notificationdto.AcceptedResponse{}, apperr.New(op).WithKind(apperr.KindUnexpected).WithErr(err)
+			}
+		}
+
+		_, _, err = s.repo.CreateNotificationBundle(ctx, n, deliveries, outboxEvents)
 		if err != nil {
 			notificationmetrics.IncError("admin_create")
 			notificationmetrics.IncAccepted("admin", string(priority), "error")
 			return notificationdto.AcceptedResponse{}, apperr.New(op).WithKind(apperr.KindUnexpected).WithErr(err).WithMessage("failed to create notification")
-		}
-
-		if !scheduled {
-			if err := s.enqueue(ctx, created, outDeliveries); err != nil {
-				notificationmetrics.IncError("admin_enqueue")
-				notificationmetrics.IncAccepted("admin", string(priority), "error")
-				return notificationdto.AcceptedResponse{}, apperr.New(op).WithKind(apperr.KindUnexpected).WithErr(err).WithMessage("failed to enqueue")
-			}
 		}
 	}
 
@@ -146,6 +461,9 @@ func (s *Service) AdminCreate(ctx context.Context, req notificationdto.AdminCrea
 	return resp, nil
 }
 
+// InternalCreate is deprecated: prefer AcceptCommand (POST
+// /internal/v1/notifications). Kept working for backward compatibility;
+// writes to the transactional outbox instead of publishing directly.
 func (s *Service) InternalCreate(ctx context.Context, req notificationdto.InternalCreateRequest) (notificationdto.AcceptedResponse, int, error) {
 	const op = "notification_service.InternalCreate"
 
@@ -153,36 +471,13 @@ func (s *Service) InternalCreate(ctx context.Context, req notificationdto.Intern
 		return notificationdto.AcceptedResponse{}, http.StatusUnprocessableEntity, &apperr.Error{Fields: fields}
 	}
 
-	hash := hashRequest(req)
-	rec, existed, err := s.repo.BeginIdempotency(ctx, req.IdempotencyKey, op, hash)
+	hash := hashJSON(req)
+	rec, outcome, err := s.repo.ClaimIdempotency(ctx, req.IdempotencyKey, op, hash)
 	if err != nil {
 		return notificationdto.AcceptedResponse{}, http.StatusInternalServerError, apperr.New(op).WithKind(apperr.KindUnexpected).WithErr(err)
 	}
-	if existed {
-		if rec.Status == "succeeded" && len(rec.ResponseBody) > 0 {
-			var resp notificationdto.AcceptedResponse
-			_ = json.Unmarshal(rec.ResponseBody, &resp)
-			code := rec.ResponseCode
-			if code == 0 {
-				code = http.StatusAccepted
-			}
-			return resp, code, nil
-		}
-		if rec.Status == "processing" {
-			return notificationdto.AcceptedResponse{}, http.StatusConflict, apperr.New(op).
-				WithKind(apperr.KindInvalid).
-				WithMessage("request already processing")
-		}
-	}
-
-	// Also check notification table for same key (unique).
-	if existing, err := s.repo.GetByIdempotencyKey(ctx, req.IdempotencyKey); err == nil {
-		resp := notificationdto.AcceptedResponse{ID: existing.ID.String(), Status: "accepted"}
-		_ = s.repo.CompleteIdempotency(ctx, req.IdempotencyKey, http.StatusAccepted, resp)
-		return resp, http.StatusAccepted, nil
-	} else if !errors.Is(err, sharederrors.ErrNotFound) {
-		_ = s.repo.FailIdempotency(ctx, req.IdempotencyKey)
-		return notificationdto.AcceptedResponse{}, http.StatusInternalServerError, apperr.New(op).WithKind(apperr.KindUnexpected).WithErr(err)
+	if resp, code, done, err := s.handleClaimOutcome(rec, outcome, op); done {
+		return resp, code, err
 	}
 
 	priority := entity.PriorityNormal
@@ -244,21 +539,21 @@ func (s *Service) InternalCreate(ctx context.Context, req notificationdto.Intern
 	}
 
 	deliveries := makeDeliveries(channels)
-	created, outDeliveries, err := s.repo.CreateNotificationWithDeliveries(ctx, n, deliveries)
+	var outboxEvents []entity.OutboxEvent
+	if !scheduled {
+		outboxEvents, err = buildOutboxEvents(n.ID, priority, deliveries)
+		if err != nil {
+			_ = s.repo.FailIdempotency(ctx, req.IdempotencyKey)
+			return notificationdto.AcceptedResponse{}, http.StatusInternalServerError, apperr.New(op).WithKind(apperr.KindUnexpected).WithErr(err)
+		}
+	}
+
+	created, _, err := s.repo.CreateNotificationBundle(ctx, n, deliveries, outboxEvents)
 	if err != nil {
 		_ = s.repo.FailIdempotency(ctx, req.IdempotencyKey)
 		notificationmetrics.IncError("internal_create")
 		notificationmetrics.IncAccepted("internal", string(priority), "error")
 		return notificationdto.AcceptedResponse{}, http.StatusInternalServerError, apperr.New(op).WithKind(apperr.KindUnexpected).WithErr(err).WithMessage("failed to create notification")
-	}
-
-	if !scheduled {
-		if err := s.enqueue(ctx, created, outDeliveries); err != nil {
-			_ = s.repo.FailIdempotency(ctx, req.IdempotencyKey)
-			notificationmetrics.IncError("internal_enqueue")
-			notificationmetrics.IncAccepted("internal", string(priority), "error")
-			return notificationdto.AcceptedResponse{}, http.StatusInternalServerError, apperr.New(op).WithKind(apperr.KindUnexpected).WithErr(err).WithMessage("failed to enqueue")
-		}
 	}
 
 	result := "success"
@@ -272,31 +567,84 @@ func (s *Service) InternalCreate(ctx context.Context, req notificationdto.Intern
 	return resp, http.StatusAccepted, nil
 }
 
-func (s *Service) enqueue(ctx context.Context, n entity.Notification, deliveries []entity.Delivery) error {
+// EnqueueExisting writes any missing outbox rows for a notification's
+// deliveries (idempotent: existing outbox rows are left untouched) and
+// marks the notification queued. It never publishes to RabbitMQ directly.
+func (s *Service) EnqueueExisting(ctx context.Context, n entity.Notification) error {
+	deliveries, err := s.repo.ListDeliveries(ctx, n.ID)
+	if err != nil {
+		return err
+	}
+
+	var events []entity.OutboxEvent
 	for _, d := range deliveries {
+		if d.Status == entity.DeliverySent || d.Status == entity.DeliveryDelivered || d.Status == entity.DeliveryPermanentFailed {
+			continue
+		}
+		has, err := s.repo.HasOutboxForDelivery(ctx, d.ID)
+		if err != nil {
+			return err
+		}
+		if has {
+			continue
+		}
 		job := notificationdto.QueueJob{
 			NotificationID: n.ID.String(),
 			DeliveryID:     d.ID.String(),
 			Channel:        string(d.Channel),
 			Attempt:        0,
 		}
-		if err := s.publisher.Publish(ctx, n.Priority, job); err != nil {
-			notificationmetrics.IncEnqueued(string(d.Channel), string(n.Priority), "error")
-			notificationmetrics.IncError("enqueue")
+		payloadJSON, err := json.Marshal(job)
+		if err != nil {
 			return err
 		}
-		notificationmetrics.IncEnqueued(string(d.Channel), string(n.Priority), "success")
+		events = append(events, entity.OutboxEvent{
+			AggregateID: n.ID,
+			DeliveryID:  d.ID,
+			EventType:   "notification.delivery.created",
+			RoutingKey:  "notification." + string(n.Priority),
+			Payload:     payloadJSON,
+			Status:      entity.OutboxPending,
+		})
+	}
+	if len(events) == 0 {
+		return nil
+	}
+	if err := s.repo.InsertOutboxEvents(ctx, events); err != nil {
+		return err
 	}
 	return s.repo.UpdateNotificationStatus(ctx, n.ID, entity.StatusQueued)
 }
 
-func (s *Service) EnqueueExisting(ctx context.Context, n entity.Notification) error {
-	deliveries, err := s.repo.ListDeliveries(ctx, n.ID)
-	if err != nil {
-		return err
-	}
-	return s.enqueue(ctx, n, deliveries)
+// PromoteScheduled claims due scheduled notifications and writes their
+// outbox rows atomically. Called periodically by the scheduler.
+func (s *Service) PromoteScheduled(ctx context.Context, limit int) (int, error) {
+	return s.repo.PromoteScheduledBatch(ctx, limit)
 }
+
+// ---------------------------------------------------------------------
+// Cleanup loop helpers (called from api + outbox processes)
+// ---------------------------------------------------------------------
+
+func (s *Service) CleanupExpiredIdempotency(ctx context.Context) (int64, error) {
+	return s.repo.CleanupExpired(ctx)
+}
+
+func (s *Service) CleanupPublishedOutbox(ctx context.Context, olderThan time.Duration) (int64, error) {
+	return s.repo.CleanupPublishedOutbox(ctx, olderThan)
+}
+
+func (s *Service) RecoverStuckOutboxLocks(ctx context.Context, timeout time.Duration) (int64, error) {
+	return s.repo.RecoverStuckOutboxLocks(ctx, timeout)
+}
+
+func (s *Service) RecoverStuckDeliveries(ctx context.Context, timeout time.Duration) (int64, error) {
+	return s.repo.RecoverStuckSending(ctx, timeout)
+}
+
+// ---------------------------------------------------------------------
+// User-facing read APIs
+// ---------------------------------------------------------------------
 
 func (s *Service) ListUser(ctx context.Context, userID string, page, perPage int) (notificationdto.UserListResponse, error) {
 	const op = "notification_service.ListUser"
@@ -380,6 +728,10 @@ func (s *Service) MarkAllRead(ctx context.Context, userID string) error {
 	return nil
 }
 
+// ---------------------------------------------------------------------
+// Admin read APIs
+// ---------------------------------------------------------------------
+
 func (s *Service) AdminList(ctx context.Context, page, perPage int) (notificationdto.AdminListResponse, error) {
 	const op = "notification_service.AdminList"
 	items, total, err := s.repo.ListAdminBatches(ctx, page, perPage)
@@ -408,7 +760,6 @@ func (s *Service) AdminList(ctx context.Context, page, perPage int) (notificatio
 		}
 		if b.BatchID != nil {
 			item.BatchID = b.BatchID.String()
-			item.ID = b.BatchID.String()
 		}
 		if b.CreatedBy != nil {
 			item.CreatedBy = b.CreatedBy.String()
@@ -445,28 +796,6 @@ func (s *Service) AdminGet(ctx context.Context, id string) (notificationdto.Admi
 		return notificationdto.AdminDetailResponse{}, apperr.New(op).WithKind(apperr.KindUnexpected).WithErr(err)
 	}
 
-	channels := make([]string, 0, len(n.Channels))
-	for _, c := range n.Channels {
-		channels = append(channels, string(c))
-	}
-	dItems := make([]notificationdto.DeliveryItem, 0, len(deliveries))
-	for _, d := range deliveries {
-		errMsg := ""
-		if d.Error != nil {
-			errMsg = *d.Error
-		}
-		dItems = append(dItems, notificationdto.DeliveryItem{
-			ID:        d.ID.String(),
-			Channel:   string(d.Channel),
-			Provider:  d.Provider,
-			Status:    string(d.Status),
-			Attempts:  d.Attempts,
-			Error:     errMsg,
-			SentAt:    d.SentAt,
-			CreatedAt: d.CreatedAt,
-		})
-	}
-
 	resp := notificationdto.AdminDetailResponse{
 		ID:          n.ID.String(),
 		UserID:      n.UserID.String(),
@@ -474,12 +803,16 @@ func (s *Service) AdminGet(ctx context.Context, id string) (notificationdto.Admi
 		Message:     n.Message,
 		Type:        n.Type,
 		Priority:    string(n.Priority),
-		Channels:    channels,
+		Channels:    channelStrings(n.Channels),
 		Status:      string(n.Status),
 		Payload:     n.Payload,
+		Locale:      n.Locale,
 		CreatedAt:   n.CreatedAt,
 		ScheduledAt: n.ScheduledAt,
-		Deliveries:  dItems,
+		Deliveries:  deliveryItems(deliveries),
+	}
+	if n.TemplateCode != nil {
+		resp.TemplateCode = *n.TemplateCode
 	}
 	if n.BatchID != nil {
 		resp.BatchID = n.BatchID.String()
@@ -493,14 +826,222 @@ func (s *Service) AdminGet(ctx context.Context, id string) (notificationdto.Admi
 	return resp, nil
 }
 
-func (s *Service) Repo() *notificationrepo.Repository {
-	return s.repo
+// AdminGetBatch returns every notification belonging to a batch, along
+// with its per-recipient deliveries.
+func (s *Service) AdminGetBatch(ctx context.Context, batchID string) (notificationdto.AdminBatchDetail, error) {
+	const op = "notification_service.AdminGetBatch"
+	bid, err := uuid.Parse(batchID)
+	if err != nil {
+		return notificationdto.AdminBatchDetail{}, apperr.New(op).WithKind(apperr.KindInvalid).WithMessage("invalid batch_id")
+	}
+	members, err := s.repo.GetBatch(ctx, bid)
+	if err != nil {
+		if errors.Is(err, sharederrors.ErrNotFound) {
+			return notificationdto.AdminBatchDetail{}, apperr.New(op).WithKind(apperr.KindNotFound).WithMessage("batch not found")
+		}
+		return notificationdto.AdminBatchDetail{}, apperr.New(op).WithKind(apperr.KindUnexpected).WithErr(err)
+	}
+
+	detail := notificationdto.AdminBatchDetail{
+		BatchID: batchID,
+	}
+	if len(members) > 0 {
+		first := members[0]
+		detail.Title = first.Title
+		detail.Message = first.Message
+		detail.Priority = string(first.Priority)
+		detail.Channels = channelStrings(first.Channels)
+		detail.CreatedAt = first.CreatedAt
+		detail.ScheduledAt = first.ScheduledAt
+	}
+
+	for _, n := range members {
+		detail.RecipientsCount++
+		switch n.Status {
+		case entity.StatusSent:
+			detail.SuccessCount++
+		case entity.StatusFailed, entity.StatusPartiallyFailed:
+			detail.FailedCount++
+		}
+		deliveries, err := s.repo.ListDeliveries(ctx, n.ID)
+		if err != nil {
+			return notificationdto.AdminBatchDetail{}, apperr.New(op).WithKind(apperr.KindUnexpected).WithErr(err)
+		}
+		detail.Members = append(detail.Members, notificationdto.AdminBatchMember{
+			ID:         n.ID.String(),
+			UserID:     n.UserID.String(),
+			Status:     string(n.Status),
+			CreatedAt:  n.CreatedAt,
+			ReadAt:     n.ReadAt,
+			Deliveries: deliveryItems(deliveries),
+		})
+	}
+	return detail, nil
 }
+
+// ---------------------------------------------------------------------
+// Admin template CRUD
+// ---------------------------------------------------------------------
+
+func (s *Service) AdminCreateTemplate(ctx context.Context, req notificationdto.TemplateCreateRequest) (notificationdto.TemplateResponse, error) {
+	const op = "notification_service.AdminCreateTemplate"
+
+	fields := map[string]string{}
+	if req.Code == "" {
+		fields["code"] = "validation.required.code"
+	}
+	if req.Channel == "" {
+		fields["channel"] = "validation.required.channel"
+	}
+	if req.Body == "" {
+		fields["body"] = "validation.required.body"
+	}
+	if len(fields) > 0 {
+		return notificationdto.TemplateResponse{}, &apperr.Error{Fields: fields}
+	}
+
+	locale := req.Locale
+	if locale == "" {
+		locale = entity.DefaultLocale
+	}
+	priority := entity.Priority(req.DefaultPriority)
+	if priority == "" {
+		priority = entity.PriorityNormal
+	}
+	enabled := true
+	if req.Enabled != nil {
+		enabled = *req.Enabled
+	}
+	var subject *string
+	if req.Subject != "" {
+		subject = &req.Subject
+	}
+
+	t, err := s.repo.CreateTemplate(ctx, entity.Template{
+		Code:            req.Code,
+		Locale:          locale,
+		Channel:         entity.Channel(req.Channel),
+		Subject:         subject,
+		Body:            req.Body,
+		DefaultPriority: priority,
+		Enabled:         enabled,
+	})
+	if err != nil {
+		if errors.Is(err, sharederrors.ErrAlreadyExists) {
+			return notificationdto.TemplateResponse{}, apperr.New(op).WithKind(apperr.KindInvalid).WithMessage("template already exists for code/locale/channel")
+		}
+		return notificationdto.TemplateResponse{}, apperr.New(op).WithKind(apperr.KindUnexpected).WithErr(err)
+	}
+	return toTemplateResponse(t), nil
+}
+
+func (s *Service) AdminListTemplates(ctx context.Context, filter notificationdto.TemplateListFilter) (notificationdto.TemplateListResponse, error) {
+	const op = "notification_service.AdminListTemplates"
+	items, total, err := s.repo.ListTemplates(ctx, filter.Code, filter.Locale, filter.Channel, filter.Enabled, filter.Page, filter.PerPage)
+	if err != nil {
+		return notificationdto.TemplateListResponse{}, apperr.New(op).WithKind(apperr.KindUnexpected).WithErr(err)
+	}
+	data := make([]notificationdto.TemplateResponse, 0, len(items))
+	for _, t := range items {
+		data = append(data, toTemplateResponse(t))
+	}
+	page, perPage := filter.Page, filter.PerPage
+	if page < 1 {
+		page = 1
+	}
+	if perPage < 1 {
+		perPage = 20
+	}
+	return notificationdto.TemplateListResponse{
+		Data: data,
+		Meta: notificationdto.ListMeta{Page: page, PerPage: perPage, Total: total},
+	}, nil
+}
+
+func (s *Service) AdminGetTemplate(ctx context.Context, id string) (notificationdto.TemplateResponse, error) {
+	const op = "notification_service.AdminGetTemplate"
+	tid, err := uuid.Parse(id)
+	if err != nil {
+		return notificationdto.TemplateResponse{}, apperr.New(op).WithKind(apperr.KindInvalid).WithMessage("invalid id")
+	}
+	t, err := s.repo.GetTemplateByID(ctx, tid)
+	if err != nil {
+		if errors.Is(err, sharederrors.ErrNotFound) {
+			return notificationdto.TemplateResponse{}, apperr.New(op).WithKind(apperr.KindNotFound).WithMessage("template not found")
+		}
+		return notificationdto.TemplateResponse{}, apperr.New(op).WithKind(apperr.KindUnexpected).WithErr(err)
+	}
+	return toTemplateResponse(t), nil
+}
+
+func (s *Service) AdminUpdateTemplate(ctx context.Context, id string, req notificationdto.TemplateUpdateRequest) (notificationdto.TemplateResponse, error) {
+	const op = "notification_service.AdminUpdateTemplate"
+	tid, err := uuid.Parse(id)
+	if err != nil {
+		return notificationdto.TemplateResponse{}, apperr.New(op).WithKind(apperr.KindInvalid).WithMessage("invalid id")
+	}
+	t, err := s.repo.UpdateTemplate(ctx, tid, req.Subject, req.Body, req.DefaultPriority)
+	if err != nil {
+		if errors.Is(err, sharederrors.ErrNotFound) {
+			return notificationdto.TemplateResponse{}, apperr.New(op).WithKind(apperr.KindNotFound).WithMessage("template not found")
+		}
+		return notificationdto.TemplateResponse{}, apperr.New(op).WithKind(apperr.KindUnexpected).WithErr(err)
+	}
+	return toTemplateResponse(t), nil
+}
+
+func (s *Service) AdminSetTemplateStatus(ctx context.Context, id string, enabled bool) error {
+	const op = "notification_service.AdminSetTemplateStatus"
+	tid, err := uuid.Parse(id)
+	if err != nil {
+		return apperr.New(op).WithKind(apperr.KindInvalid).WithMessage("invalid id")
+	}
+	if err := s.repo.SetTemplateEnabled(ctx, tid, enabled); err != nil {
+		if errors.Is(err, sharederrors.ErrNotFound) {
+			return apperr.New(op).WithKind(apperr.KindNotFound).WithMessage("template not found")
+		}
+		return apperr.New(op).WithKind(apperr.KindUnexpected).WithErr(err)
+	}
+	return nil
+}
+
+// ---------------------------------------------------------------------
+// helpers
+// ---------------------------------------------------------------------
 
 func toChannels(in []string) []entity.Channel {
 	out := make([]entity.Channel, 0, len(in))
 	for _, c := range in {
 		out = append(out, entity.Channel(c))
+	}
+	return out
+}
+
+func channelStrings(channels []entity.Channel) []string {
+	out := make([]string, 0, len(channels))
+	for _, c := range channels {
+		out = append(out, string(c))
+	}
+	return out
+}
+
+func deliveryItems(deliveries []entity.Delivery) []notificationdto.DeliveryItem {
+	out := make([]notificationdto.DeliveryItem, 0, len(deliveries))
+	for _, d := range deliveries {
+		errMsg := ""
+		if d.Error != nil {
+			errMsg = *d.Error
+		}
+		out = append(out, notificationdto.DeliveryItem{
+			ID:        d.ID.String(),
+			Channel:   string(d.Channel),
+			Provider:  d.Provider,
+			Status:    string(d.Status),
+			Attempts:  d.Attempts,
+			Error:     errMsg,
+			SentAt:    d.SentAt,
+			CreatedAt: d.CreatedAt,
+		})
 	}
 	return out
 }
@@ -519,8 +1060,182 @@ func makeDeliveries(channels []entity.Channel) []entity.Delivery {
 	return out
 }
 
-func hashRequest(req notificationdto.InternalCreateRequest) string {
-	b, _ := json.Marshal(req)
+// buildOutboxEvents creates one pending outbox row per delivery, routed by
+// notification priority (matches queue.QueueName's "notification.<priority>"
+// convention).
+func buildOutboxEvents(notificationID uuid.UUID, priority entity.Priority, deliveries []entity.Delivery) ([]entity.OutboxEvent, error) {
+	out := make([]entity.OutboxEvent, 0, len(deliveries))
+	for _, d := range deliveries {
+		job := notificationdto.QueueJob{
+			NotificationID: notificationID.String(),
+			DeliveryID:     d.ID.String(),
+			Channel:        string(d.Channel),
+			Attempt:        0,
+		}
+		payload, err := json.Marshal(job)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, entity.OutboxEvent{
+			AggregateID: notificationID,
+			DeliveryID:  d.ID,
+			EventType:   "notification.delivery.created",
+			RoutingKey:  "notification." + string(priority),
+			Payload:     payload,
+			Status:      entity.OutboxPending,
+		})
+	}
+	return out, nil
+}
+
+// filterChannelsByContacts drops channels the user cannot receive: opted
+// out via preferences, or missing/unverified contact info for
+// email/sms/whatsapp. in_app and push always pass through.
+func filterChannelsByContacts(channels []entity.Channel, contacts notificationcontract.Contacts) []entity.Channel {
+	out := make([]entity.Channel, 0, len(channels))
+	for _, ch := range channels {
+		if pref, ok := contacts.Preferences[string(ch)]; ok && !pref {
+			continue
+		}
+		switch ch {
+		case entity.ChannelEmail:
+			if contacts.Email == "" || !contacts.EmailVerified {
+				continue
+			}
+		case entity.ChannelSMS, entity.ChannelWhatsApp:
+			if contacts.Phone == "" || !contacts.PhoneVerified {
+				continue
+			}
+		}
+		out = append(out, ch)
+	}
+	return out
+}
+
+// loadTemplatesForChannels loads the best enabled template per channel,
+// silently dropping channels without a matching template. It returns the
+// loaded templates alongside the surviving channel list (same order).
+func (s *Service) loadTemplatesForChannels(ctx context.Context, code, locale string, channels []entity.Channel) ([]entity.Template, []entity.Channel, error) {
+	templates := make([]entity.Template, 0, len(channels))
+	kept := make([]entity.Channel, 0, len(channels))
+	for _, ch := range channels {
+		t, err := s.repo.GetEnabledTemplate(ctx, code, locale, string(ch))
+		if err != nil {
+			if errors.Is(err, sharederrors.ErrNotFound) {
+				continue
+			}
+			return nil, nil, err
+		}
+		templates = append(templates, t)
+		kept = append(kept, ch)
+	}
+	return templates, kept, nil
+}
+
+// validateTemplateVariables dry-renders every template's subject+body with
+// the supplied variables, returning field errors keyed by channel for any
+// missing variables. It does not persist rendered output — final,
+// per-channel rendering happens in the worker at send time.
+func validateTemplateVariables(templates []entity.Template, vars map[string]any) map[string]string {
+	fields := map[string]string{}
+	for _, t := range templates {
+		subject := ""
+		if t.Subject != nil {
+			subject = *t.Subject
+		}
+		if _, _, err := notificationtemplate.RenderPair(subject, t.Body, vars); err != nil {
+			notificationmetrics.IncTemplateRenderError(string(t.Channel))
+			var missErr *notificationtemplate.MissingVariableError
+			if errors.As(err, &missErr) {
+				fields["variables["+string(t.Channel)+"]"] = "validation.missing." + joinComma(missErr.Variables)
+			} else {
+				fields["variables["+string(t.Channel)+"]"] = "validation.invalid.variables"
+			}
+		}
+	}
+	return fields
+}
+
+func resolvePriority(requested string, templates []entity.Template) entity.Priority {
+	if requested != "" {
+		return entity.Priority(requested)
+	}
+	for _, want := range channelPriorityOrder {
+		for _, t := range templates {
+			if t.Channel == want && t.DefaultPriority != "" {
+				return t.DefaultPriority
+			}
+		}
+	}
+	if len(templates) > 0 && templates[0].DefaultPriority != "" {
+		return templates[0].DefaultPriority
+	}
+	return entity.PriorityNormal
+}
+
+// primaryTitleMessage renders the highest-priority channel's template to
+// fill the notification's legacy single title/message columns (used for
+// admin/user display only; the worker re-renders per channel at send
+// time).
+func primaryTitleMessage(templates []entity.Template, vars map[string]any, fallback string) (string, string) {
+	byChannel := make(map[entity.Channel]entity.Template, len(templates))
+	for _, t := range templates {
+		byChannel[t.Channel] = t
+	}
+	for _, ch := range channelPriorityOrder {
+		t, ok := byChannel[ch]
+		if !ok {
+			continue
+		}
+		subject := ""
+		if t.Subject != nil {
+			subject = *t.Subject
+		}
+		renderedSubject, renderedBody, err := notificationtemplate.RenderPair(subject, t.Body, vars)
+		if err != nil {
+			continue
+		}
+		if renderedSubject == "" {
+			renderedSubject = fallback
+		}
+		return renderedSubject, renderedBody
+	}
+	return fallback, ""
+}
+
+func joinComma(in []string) string {
+	out := ""
+	for i, v := range in {
+		if i > 0 {
+			out += ","
+		}
+		out += v
+	}
+	return out
+}
+
+func toTemplateResponse(t entity.Template) notificationdto.TemplateResponse {
+	subject := ""
+	if t.Subject != nil {
+		subject = *t.Subject
+	}
+	return notificationdto.TemplateResponse{
+		ID:              t.ID.String(),
+		Code:            t.Code,
+		Locale:          t.Locale,
+		Channel:         string(t.Channel),
+		Subject:         subject,
+		Body:            t.Body,
+		DefaultPriority: string(t.DefaultPriority),
+		Enabled:         t.Enabled,
+		Version:         t.Version,
+		CreatedAt:       t.CreatedAt,
+		UpdatedAt:       t.UpdatedAt,
+	}
+}
+
+func hashJSON(v any) string {
+	b, _ := json.Marshal(v)
 	sum := sha256.Sum256(b)
 	return hex.EncodeToString(sum[:])
 }

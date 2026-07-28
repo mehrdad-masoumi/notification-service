@@ -45,6 +45,9 @@ type notificationRow struct {
 	CreatedBy      *uuid.UUID      `db:"created_by"`
 	Email          *string         `db:"email"`
 	Phone          *string         `db:"phone"`
+	TemplateCode   *string         `db:"template_code"`
+	Locale         string          `db:"locale"`
+	Variables      json.RawMessage `db:"variables"`
 	CreatedAt      time.Time       `db:"created_at"`
 	UpdatedAt      time.Time       `db:"updated_at"`
 }
@@ -92,6 +95,9 @@ func mapNotification(row notificationRow) (entity.Notification, error) {
 		CreatedBy:      row.CreatedBy,
 		Email:          row.Email,
 		Phone:          row.Phone,
+		TemplateCode:   row.TemplateCode,
+		Locale:         row.Locale,
+		Variables:      row.Variables,
 		CreatedAt:      row.CreatedAt,
 		UpdatedAt:      row.UpdatedAt,
 	}, nil
@@ -113,7 +119,17 @@ func mapDelivery(row deliveryRow) entity.Delivery {
 	}
 }
 
-func (r *Repository) CreateNotificationWithDeliveries(ctx context.Context, n entity.Notification, deliveries []entity.Delivery) (entity.Notification, []entity.Delivery, error) {
+// CreateNotificationBundle inserts a notification, its deliveries, and any
+// outbox events in a single transaction (transactional outbox pattern).
+// outboxEvents may be empty (e.g. for notifications that are scheduled for
+// the future; outbox rows are written later when the scheduler promotes
+// them to due).
+func (r *Repository) CreateNotificationBundle(
+	ctx context.Context,
+	n entity.Notification,
+	deliveries []entity.Delivery,
+	outboxEvents []entity.OutboxEvent,
+) (entity.Notification, []entity.Delivery, error) {
 	tx, err := r.db.BeginTxx(ctx, nil)
 	if err != nil {
 		return entity.Notification{}, nil, err
@@ -127,6 +143,12 @@ func (r *Repository) CreateNotificationWithDeliveries(ctx context.Context, n ent
 	if n.Payload == nil {
 		n.Payload = json.RawMessage(`{}`)
 	}
+	if n.Variables == nil {
+		n.Variables = json.RawMessage(`{}`)
+	}
+	if n.Locale == "" {
+		n.Locale = entity.DefaultLocale
+	}
 	if n.ID == uuid.Nil {
 		n.ID = uuid.New()
 	}
@@ -134,12 +156,14 @@ func (r *Repository) CreateNotificationWithDeliveries(ctx context.Context, n ent
 	_, err = tx.ExecContext(ctx, `
 		INSERT INTO notifications (
 			id, user_id, batch_id, title, message, type, priority, payload, action_url,
-			status, idempotency_key, channels, scheduled_at, created_by, email, phone
+			status, idempotency_key, channels, scheduled_at, created_by, email, phone,
+			template_code, locale, variables
 		) VALUES (
-			$1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16
+			$1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19
 		)`,
 		n.ID, n.UserID, n.BatchID, n.Title, n.Message, n.Type, n.Priority, n.Payload, n.ActionURL,
 		n.Status, n.IdempotencyKey, channelsJSON, n.ScheduledAt, n.CreatedBy, n.Email, n.Phone,
+		n.TemplateCode, n.Locale, n.Variables,
 	)
 	if err != nil {
 		return entity.Notification{}, nil, fmt.Errorf("insert notification: %w", err)
@@ -161,6 +185,27 @@ func (r *Repository) CreateNotificationWithDeliveries(ctx context.Context, n ent
 			return entity.Notification{}, nil, fmt.Errorf("insert delivery: %w", err)
 		}
 		outDeliveries = append(outDeliveries, d)
+	}
+
+	for _, e := range outboxEvents {
+		if e.ID == uuid.Nil {
+			e.ID = uuid.New()
+		}
+		if e.Status == "" {
+			e.Status = entity.OutboxPending
+		}
+		if e.AvailableAt.IsZero() {
+			e.AvailableAt = time.Now().UTC()
+		}
+		_, err = tx.ExecContext(ctx, `
+			INSERT INTO notification_outbox (
+				id, aggregate_id, delivery_id, event_type, routing_key, payload, status, available_at
+			) VALUES ($1,$2,$3,$4,$5,$6,$7,$8)`,
+			e.ID, e.AggregateID, e.DeliveryID, e.EventType, e.RoutingKey, e.Payload, e.Status, e.AvailableAt,
+		)
+		if err != nil {
+			return entity.Notification{}, nil, fmt.Errorf("insert outbox event: %w", err)
+		}
 	}
 
 	if err := tx.Commit(); err != nil {
@@ -196,42 +241,6 @@ func (r *Repository) GetByIdempotencyKey(ctx context.Context, key string) (entit
 		return entity.Notification{}, err
 	}
 	return mapNotification(row)
-}
-
-func (r *Repository) ListDeliveries(ctx context.Context, notificationID uuid.UUID) ([]entity.Delivery, error) {
-	var rows []deliveryRow
-	err := r.db.SelectContext(ctx, &rows, `
-		SELECT * FROM notification_deliveries WHERE notification_id = $1 ORDER BY created_at ASC`, notificationID)
-	if err != nil {
-		return nil, err
-	}
-	out := make([]entity.Delivery, 0, len(rows))
-	for _, row := range rows {
-		out = append(out, mapDelivery(row))
-	}
-	return out, nil
-}
-
-func (r *Repository) GetDelivery(ctx context.Context, id uuid.UUID) (entity.Delivery, error) {
-	var row deliveryRow
-	err := r.db.GetContext(ctx, &row, `SELECT * FROM notification_deliveries WHERE id = $1`, id)
-	if errors.Is(err, sql.ErrNoRows) {
-		return entity.Delivery{}, sharederrors.ErrNotFound
-	}
-	if err != nil {
-		return entity.Delivery{}, err
-	}
-	return mapDelivery(row), nil
-}
-
-func (r *Repository) UpdateDelivery(ctx context.Context, d entity.Delivery) error {
-	_, err := r.db.ExecContext(ctx, `
-		UPDATE notification_deliveries
-		SET provider = $2, status = $3, attempts = $4, error = $5, sent_at = $6, delivered_at = $7, updated_at = NOW()
-		WHERE id = $1`,
-		d.ID, d.Provider, d.Status, d.Attempts, d.Error, d.SentAt, d.DeliveredAt,
-	)
-	return err
 }
 
 func (r *Repository) UpdateNotificationStatus(ctx context.Context, id uuid.UUID, status entity.NotificationStatus) error {
@@ -277,6 +286,10 @@ func (r *Repository) RecomputeNotificationStatus(ctx context.Context, notificati
 	return r.UpdateNotificationStatus(ctx, notificationID, status)
 }
 
+// ListForUser returns in-app-visible notifications for a user. A
+// notification is visible if it targets the in_app channel (either via the
+// channels array or via an in_app delivery row) and is not still awaiting
+// its scheduled time.
 func (r *Repository) ListForUser(ctx context.Context, userID uuid.UUID, page, perPage int) ([]entity.Notification, int64, error) {
 	if page < 1 {
 		page = 1
@@ -286,17 +299,27 @@ func (r *Repository) ListForUser(ctx context.Context, userID uuid.UUID, page, pe
 	}
 	offset := (page - 1) * perPage
 
+	const visibilityWhere = `
+		user_id = $1
+		AND status <> 'scheduled'
+		AND (
+			channels @> '"in_app"'::jsonb
+			OR EXISTS (
+				SELECT 1 FROM notification_deliveries d
+				WHERE d.notification_id = notifications.id AND d.channel = 'in_app'
+			)
+		)`
+
 	var total int64
 	if err := r.db.GetContext(ctx, &total, `
-		SELECT COUNT(*) FROM notifications
-		WHERE user_id = $1 AND channels::text LIKE '%in_app%'`, userID); err != nil {
+		SELECT COUNT(*) FROM notifications WHERE `+visibilityWhere, userID); err != nil {
 		return nil, 0, err
 	}
 
 	var rows []notificationRow
 	err := r.db.SelectContext(ctx, &rows, `
 		SELECT * FROM notifications
-		WHERE user_id = $1 AND channels::text LIKE '%in_app%'
+		WHERE `+visibilityWhere+`
 		ORDER BY created_at DESC
 		LIMIT $2 OFFSET $3`, userID, perPage, offset)
 	if err != nil {
@@ -318,7 +341,14 @@ func (r *Repository) UnreadCount(ctx context.Context, userID uuid.UUID) (int64, 
 	var count int64
 	err := r.db.GetContext(ctx, &count, `
 		SELECT COUNT(*) FROM notifications
-		WHERE user_id = $1 AND read_at IS NULL AND channels::text LIKE '%in_app%'`, userID)
+		WHERE user_id = $1 AND read_at IS NULL AND status <> 'scheduled'
+		AND (
+			channels @> '"in_app"'::jsonb
+			OR EXISTS (
+				SELECT 1 FROM notification_deliveries d
+				WHERE d.notification_id = notifications.id AND d.channel = 'in_app'
+			)
+		)`, userID)
 	return count, err
 }
 
@@ -344,7 +374,14 @@ func (r *Repository) MarkRead(ctx context.Context, userID, id uuid.UUID) error {
 func (r *Repository) MarkAllRead(ctx context.Context, userID uuid.UUID) (int64, error) {
 	res, err := r.db.ExecContext(ctx, `
 		UPDATE notifications SET read_at = NOW(), updated_at = NOW()
-		WHERE user_id = $1 AND read_at IS NULL AND channels::text LIKE '%in_app%'`, userID)
+		WHERE user_id = $1 AND read_at IS NULL AND status <> 'scheduled'
+		AND (
+			channels @> '"in_app"'::jsonb
+			OR EXISTS (
+				SELECT 1 FROM notification_deliveries d
+				WHERE d.notification_id = notifications.id AND d.channel = 'in_app'
+			)
+		)`, userID)
 	if err != nil {
 		return 0, err
 	}
@@ -368,6 +405,10 @@ type batchAggRow struct {
 	ScheduledAt     *time.Time      `db:"scheduled_at"`
 }
 
+// ListAdminBatches lists one row per batch (grouped by batch_id, or by id
+// for single-recipient notifications). The notification's own ID is always
+// preserved in BatchSummary.ID; BatchSummary.BatchID is populated
+// separately and only when the notification belongs to a batch.
 func (r *Repository) ListAdminBatches(ctx context.Context, page, perPage int) ([]entity.BatchSummary, int64, error) {
 	if page < 1 {
 		page = 1
@@ -409,7 +450,7 @@ func (r *Repository) ListAdminBatches(ctx context.Context, page, perPage int) ([
 			GROUP BY g.group_key
 		)
 		SELECT
-			n.id,
+			first_row.id,
 			n.batch_id,
 			n.title,
 			n.message,
@@ -423,14 +464,14 @@ func (r *Repository) ListAdminBatches(ctx context.Context, page, perPage int) ([
 			n.created_by,
 			a.created_at,
 			a.scheduled_at
-		FROM notifications n
-		INNER JOIN agg a ON COALESCE(n.batch_id, n.id) = a.group_key
+		FROM agg a
 		INNER JOIN LATERAL (
 			SELECT id FROM notifications n2
 			WHERE COALESCE(n2.batch_id, n2.id) = a.group_key
 			ORDER BY n2.created_at ASC
 			LIMIT 1
-		) first_row ON n.id = first_row.id
+		) first_row ON true
+		INNER JOIN notifications n ON n.id = first_row.id
 		ORDER BY a.created_at DESC
 	`, perPage, offset)
 	if err != nil {
@@ -465,15 +506,17 @@ func (r *Repository) ListAdminBatches(ctx context.Context, page, perPage int) ([
 	return out, total, nil
 }
 
-func (r *Repository) ListDueScheduled(ctx context.Context, limit int) ([]entity.Notification, error) {
+// GetBatch returns every notification belonging to a batch (identified by
+// batch_id), ordered by creation time.
+func (r *Repository) GetBatch(ctx context.Context, batchID uuid.UUID) ([]entity.Notification, error) {
 	var rows []notificationRow
 	err := r.db.SelectContext(ctx, &rows, `
-		SELECT * FROM notifications
-		WHERE status = 'scheduled' AND scheduled_at IS NOT NULL AND scheduled_at <= NOW()
-		ORDER BY scheduled_at ASC
-		LIMIT $1`, limit)
+		SELECT * FROM notifications WHERE batch_id = $1 ORDER BY created_at ASC`, batchID)
 	if err != nil {
 		return nil, err
+	}
+	if len(rows) == 0 {
+		return nil, sharederrors.ErrNotFound
 	}
 	out := make([]entity.Notification, 0, len(rows))
 	for _, row := range rows {
@@ -484,80 +527,4 @@ func (r *Repository) ListDueScheduled(ctx context.Context, limit int) ([]entity.
 		out = append(out, n)
 	}
 	return out, nil
-}
-
-func (r *Repository) ClaimScheduled(ctx context.Context, id uuid.UUID) (bool, error) {
-	res, err := r.db.ExecContext(ctx, `
-		UPDATE notifications SET status = 'queued', updated_at = NOW()
-		WHERE id = $1 AND status = 'scheduled'`, id)
-	if err != nil {
-		return false, err
-	}
-	n, _ := res.RowsAffected()
-	return n > 0, nil
-}
-
-// Idempotency helpers
-
-type IdempotencyRecord struct {
-	Status       string
-	ResponseCode int
-	ResponseBody json.RawMessage
-}
-
-func (r *Repository) BeginIdempotency(ctx context.Context, key, operation, requestHash string) (*IdempotencyRecord, bool, error) {
-	var status string
-	var code sql.NullInt64
-	var body []byte
-	err := r.db.QueryRowContext(ctx, `
-		SELECT status, response_code, response_body FROM idempotency_keys WHERE ide_key = $1`, key,
-	).Scan(&status, &code, &body)
-	if err == nil {
-		rec := &IdempotencyRecord{Status: status, ResponseBody: body}
-		if code.Valid {
-			rec.ResponseCode = int(code.Int64)
-		}
-		return rec, true, nil
-	}
-	if !errors.Is(err, sql.ErrNoRows) {
-		return nil, false, err
-	}
-
-	_, err = r.db.ExecContext(ctx, `
-		INSERT INTO idempotency_keys (ide_key, operation, request_hash, status)
-		VALUES ($1,$2,$3,'processing')
-		ON CONFLICT (ide_key) DO NOTHING`, key, operation, requestHash)
-	if err != nil {
-		return nil, false, err
-	}
-
-	err = r.db.QueryRowContext(ctx, `
-		SELECT status, response_code, response_body FROM idempotency_keys WHERE ide_key = $1`, key,
-	).Scan(&status, &code, &body)
-	if err != nil {
-		return nil, false, err
-	}
-	rec := &IdempotencyRecord{Status: status, ResponseBody: body}
-	if code.Valid {
-		rec.ResponseCode = int(code.Int64)
-	}
-	return rec, status != "processing", nil
-}
-
-func (r *Repository) CompleteIdempotency(ctx context.Context, key string, code int, body any) error {
-	b, err := json.Marshal(body)
-	if err != nil {
-		return err
-	}
-	_, err = r.db.ExecContext(ctx, `
-		UPDATE idempotency_keys
-		SET status = 'succeeded', response_code = $2, response_body = $3, updated_at = NOW()
-		WHERE ide_key = $1`, key, code, b)
-	return err
-}
-
-func (r *Repository) FailIdempotency(ctx context.Context, key string) error {
-	_, err := r.db.ExecContext(ctx, `
-		UPDATE idempotency_keys SET status = 'failed', updated_at = NOW() WHERE ide_key = $1`, key)
-	return err
 }

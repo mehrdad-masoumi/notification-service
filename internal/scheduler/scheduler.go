@@ -5,11 +5,14 @@ import (
 	"log"
 	"time"
 
-	"notification-service/internal/notification/entity"
 	notificationmetrics "notification-service/internal/notification/metrics"
 	notificationservice "notification-service/internal/notification/service"
 )
 
+// Scheduler periodically promotes due ('scheduled' and scheduled_at <=
+// NOW()) notifications to 'pending' and writes their outbox rows, all in
+// one atomic transaction (see repository.PromoteScheduledBatch). It never
+// publishes to RabbitMQ directly: the outbox publisher process does that.
 type Scheduler struct {
 	svc      *notificationservice.Service
 	interval time.Duration
@@ -40,32 +43,14 @@ func (s *Scheduler) Run(ctx context.Context) {
 }
 
 func (s *Scheduler) tick(ctx context.Context) {
-	repo := s.svc.Repo()
-	due, err := repo.ListDueScheduled(ctx, s.batch)
+	promoted, err := s.svc.PromoteScheduled(ctx, s.batch)
 	if err != nil {
-		log.Printf("scheduler list due: %v", err)
-		notificationmetrics.IncError("scheduler_list")
+		log.Printf("scheduler promote: %v", err)
+		notificationmetrics.IncError("scheduler_promote")
 		notificationmetrics.IncSchedulerClaimed("error")
 		return
 	}
-	for _, n := range due {
-		claimed, err := repo.ClaimScheduled(ctx, n.ID)
-		if err != nil {
-			log.Printf("scheduler claim %s: %v", n.ID, err)
-			notificationmetrics.IncError("scheduler_claim")
-			notificationmetrics.IncSchedulerClaimed("error")
-			continue
-		}
-		if !claimed {
-			continue
-		}
-		n.Status = entity.StatusQueued
-		if err := s.svc.EnqueueExisting(ctx, n); err != nil {
-			log.Printf("scheduler enqueue %s: %v", n.ID, err)
-			notificationmetrics.IncError("scheduler_enqueue")
-			notificationmetrics.IncSchedulerClaimed("error")
-			continue
-		}
+	for i := 0; i < promoted; i++ {
 		notificationmetrics.IncSchedulerClaimed("success")
 	}
 }

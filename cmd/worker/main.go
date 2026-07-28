@@ -19,7 +19,7 @@ import (
 	notificationrepo "notification-service/internal/notification/repository"
 	providerregistry "notification-service/internal/provider/registry"
 	"notification-service/internal/queue"
-	"notification-service/internal/userdirectory"
+	"notification-service/internal/userclient"
 	"notification-service/internal/worker"
 )
 
@@ -55,12 +55,14 @@ func main() {
 
 	repo := notificationrepo.New(sqlDB)
 	registry := providerregistry.New(cfg)
-	userResolver := newUserDirectory(cfg)
+	users := newUserClient(cfg)
 
-	processor := worker.NewProcessor(repo, registry, userResolver, mq, cfg.Worker.MaxRetries, mq)
+	processor := worker.NewProcessor(repo, registry, users, mq, cfg.Worker.MaxRetries, mq)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
+
+	go runStuckDeliveryRecovery(ctx, processor, cfg)
 
 	e := httpserver.NewEchoMinimal()
 	httpserver.RegisterMetrics(e)
@@ -113,9 +115,34 @@ func main() {
 	log.Println("worker stopped")
 }
 
-func newUserDirectory(cfg config.Config) notificationcontract.IFUserDirectory {
+func newUserClient(cfg config.Config) notificationcontract.IFUserContacts {
 	if cfg.UserService.BaseURL == "" {
-		return userdirectory.NoopDirectory{}
+		return userclient.Noop{}
 	}
-	return userdirectory.NewHTTP(cfg.UserService)
+	return userclient.New(cfg.UserService)
+}
+
+// runStuckDeliveryRecovery periodically resets deliveries stuck in
+// 'sending' (e.g. after a worker crash between claim and completion) back
+// to 'failed' so they become eligible for retry again.
+func runStuckDeliveryRecovery(ctx context.Context, processor *worker.Processor, cfg config.Config) {
+	timeout := time.Duration(cfg.Outbox.LockTimeoutSeconds) * time.Second
+	if timeout <= 0 {
+		timeout = time.Minute
+	}
+	ticker := time.NewTicker(timeout)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			if n, err := processor.RecoverStuckDeliveries(ctx, timeout); err != nil {
+				log.Printf("recover stuck deliveries: %v", err)
+			} else if n > 0 {
+				log.Printf("recovered %d stuck deliveries", n)
+			}
+		}
+	}
 }

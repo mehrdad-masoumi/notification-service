@@ -13,10 +13,15 @@ import (
 	"notification-service/config"
 	notificationdto "notification-service/internal/notification/dto"
 	"notification-service/internal/notification/entity"
+	notificationmetrics "notification-service/internal/notification/metrics"
 )
 
 const (
 	exchangeName = "notification"
+	// confirmTimeout bounds how long PublishWithConfirm waits for a
+	// broker ack/nack (or a mandatory-publish return) before treating the
+	// publish as failed/unknown and letting the caller retry.
+	confirmTimeout = 5 * time.Second
 )
 
 var priorities = []entity.Priority{
@@ -138,6 +143,11 @@ func (c *Client) SetupTopology() error {
 	return nil
 }
 
+// Publish is a fire-and-forget publish (persistent, non-mandatory). Used by
+// the worker to re-enqueue a job for immediate retry after a temporary
+// failure; delivery is already tracked in Postgres so an occasional lost
+// publish is caught by RecoverStuckSending/outbox reconciliation rather
+// than blocking the retry path on a broker round-trip.
 func (c *Client) Publish(ctx context.Context, priority entity.Priority, job notificationdto.QueueJob) error {
 	body, err := json.Marshal(job)
 	if err != nil {
@@ -158,6 +168,62 @@ func (c *Client) Publish(ctx context.Context, priority entity.Priority, job noti
 			"x-attempt": job.Attempt,
 		},
 	})
+}
+
+// PublishWithConfirm publishes with the channel in confirm mode and
+// mandatory=true, blocking until the broker acknowledges the message (or
+// returns it as unroutable) or confirmTimeout elapses. This is the
+// reliable publish path used by the outbox publisher, so a message is
+// only marked "published" in Postgres once RabbitMQ has actually
+// persisted/routed it.
+func (c *Client) PublishWithConfirm(ctx context.Context, routingKey string, body []byte) error {
+	ch, err := c.channel()
+	if err != nil {
+		return err
+	}
+	defer ch.Close()
+
+	if err := ch.Confirm(false); err != nil {
+		return fmt.Errorf("enable confirm mode: %w", err)
+	}
+
+	confirms := ch.NotifyPublish(make(chan amqp.Confirmation, 1))
+	returns := ch.NotifyReturn(make(chan amqp.Return, 1))
+
+	err = ch.PublishWithContext(ctx, exchangeName, routingKey, true, false, amqp.Publishing{
+		ContentType:  "application/json",
+		DeliveryMode: amqp.Persistent,
+		Body:         body,
+	})
+	if err != nil {
+		notificationmetrics.IncOutboxPublish("publish_error")
+		return fmt.Errorf("publish: %w", err)
+	}
+
+	timer := time.NewTimer(confirmTimeout)
+	defer timer.Stop()
+
+	select {
+	case ret := <-returns:
+		notificationmetrics.IncOutboxPublish("returned")
+		return fmt.Errorf("message returned as unroutable: reply=%s routing_key=%s", ret.ReplyText, ret.RoutingKey)
+	case conf, ok := <-confirms:
+		if !ok {
+			notificationmetrics.IncOutboxPublish("confirm_channel_closed")
+			return fmt.Errorf("confirm channel closed before ack")
+		}
+		if !conf.Ack {
+			notificationmetrics.IncOutboxPublish("nack")
+			return fmt.Errorf("broker nacked publish")
+		}
+		notificationmetrics.IncOutboxPublish("success")
+		return nil
+	case <-timer.C:
+		notificationmetrics.IncOutboxPublish("timeout")
+		return fmt.Errorf("timed out waiting for publish confirmation")
+	case <-ctx.Done():
+		return ctx.Err()
+	}
 }
 
 func (c *Client) PublishToDLQ(ctx context.Context, priority entity.Priority, job notificationdto.QueueJob) error {

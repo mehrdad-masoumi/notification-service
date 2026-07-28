@@ -22,7 +22,7 @@ import (
 type Processor struct {
 	repo       *notificationrepo.Repository
 	registry   notificationcontract.IFProviderRegistry
-	users      notificationcontract.IFUserDirectory
+	users      notificationcontract.IFUserContacts
 	publisher  notificationcontract.IFPublisher
 	maxRetries int
 	dlq        *queue.Client
@@ -31,7 +31,7 @@ type Processor struct {
 func NewProcessor(
 	repo *notificationrepo.Repository,
 	registry notificationcontract.IFProviderRegistry,
-	users notificationcontract.IFUserDirectory,
+	users notificationcontract.IFUserContacts,
 	publisher notificationcontract.IFPublisher,
 	maxRetries int,
 	dlq *queue.Client,
@@ -59,20 +59,23 @@ func (p *Processor) Handle(ctx context.Context, job notificationdto.QueueJob, at
 		return nil
 	}
 
-	delivery, err := p.repo.GetDelivery(ctx, deliveryID)
+	// Atomically transition pending/failed -> sending. If the delivery is
+	// already sending/sent/delivered/permanent_failed, ClaimDelivery
+	// returns ErrNotFound and we skip: another worker (or a previous
+	// attempt) already owns/finished it.
+	delivery, err := p.repo.ClaimDelivery(ctx, deliveryID)
 	if err != nil {
 		if errors.Is(err, sharederrors.ErrNotFound) {
 			return nil
 		}
-		notificationmetrics.IncError("get_delivery")
+		notificationmetrics.IncError("claim_delivery")
 		return err
 	}
 
-	if delivery.Status == entity.DeliverySent || delivery.Status == entity.DeliveryDelivered {
-		return nil
-	}
-	if delivery.Status == entity.DeliveryPermanentFailed {
-		return nil
+	if delivery.NotificationID != notificationID {
+		log.Printf("delivery %s does not belong to notification %s in job; skipping", deliveryID, notificationID)
+		notificationmetrics.IncError("delivery_notification_mismatch")
+		return p.failPermanentClaimed(ctx, delivery, "notification_id mismatch")
 	}
 
 	n, err := p.repo.GetByID(ctx, notificationID)
@@ -84,7 +87,10 @@ func (p *Processor) Handle(ctx context.Context, job notificationdto.QueueJob, at
 		return err
 	}
 
-	_ = p.repo.UpdateNotificationStatus(ctx, n.ID, entity.StatusProcessing)
+	if err := p.repo.UpdateNotificationStatus(ctx, n.ID, entity.StatusProcessing); err != nil {
+		notificationmetrics.IncError("update_notification_status")
+		return err
+	}
 
 	provider, err := p.registry.Get(string(delivery.Channel))
 	if err != nil {
@@ -102,10 +108,11 @@ func (p *Processor) Handle(ctx context.Context, job notificationdto.QueueJob, at
 		return p.failTemporary(ctx, n, delivery, job, attempt, sanitizeErr(resolveErr))
 	}
 
-	delivery.Status = entity.DeliverySending
-	delivery.Attempts = attempt + 1
 	delivery.Provider = provider.Name()
-	_ = p.repo.UpdateDelivery(ctx, delivery)
+	if err := p.repo.UpdateDelivery(ctx, delivery); err != nil {
+		notificationmetrics.IncError("update_delivery")
+		return err
+	}
 
 	actionURL := ""
 	if n.ActionURL != nil {
@@ -119,6 +126,7 @@ func (p *Processor) Handle(ctx context.Context, job notificationdto.QueueJob, at
 	_, sendErr := provider.Send(ctx, notificationcontract.SendRequest{
 		NotificationID: n.ID.String(),
 		DeliveryID:     delivery.ID.String(),
+		IdempotencyKey: delivery.ID.String(),
 		UserID:         n.UserID.String(),
 		Channel:        string(delivery.Channel),
 		To:             to,
@@ -145,6 +153,7 @@ func (p *Processor) Handle(ctx context.Context, job notificationdto.QueueJob, at
 		return err
 	}
 	notificationmetrics.ObserveDelivery(string(delivery.Channel), "success", startedAt)
+	notificationmetrics.IncDelivery(string(delivery.Channel), "success")
 	return p.repo.RecomputeNotificationStatus(ctx, n.ID)
 }
 
@@ -156,7 +165,7 @@ func (p *Processor) resolveRecipient(ctx context.Context, n entity.Notification,
 		if n.Email != nil && *n.Email != "" {
 			return *n.Email, nil
 		}
-		contacts, err := p.users.Resolve(ctx, n.UserID.String())
+		contacts, err := p.users.ResolveContacts(ctx, n.UserID.String())
 		if err != nil {
 			return "", err
 		}
@@ -168,7 +177,7 @@ func (p *Processor) resolveRecipient(ctx context.Context, n entity.Notification,
 		if n.Phone != nil && *n.Phone != "" {
 			return *n.Phone, nil
 		}
-		contacts, err := p.users.Resolve(ctx, n.UserID.String())
+		contacts, err := p.users.ResolveContacts(ctx, n.UserID.String())
 		if err != nil {
 			return "", err
 		}
@@ -185,10 +194,15 @@ func (p *Processor) failPermanent(ctx context.Context, n entity.Notification, de
 	delivery.Status = entity.DeliveryPermanentFailed
 	delivery.Error = &msg
 	if err := p.repo.UpdateDelivery(ctx, delivery); err != nil {
+		notificationmetrics.IncError("update_delivery")
 		return err
 	}
-	_ = p.repo.RecomputeNotificationStatus(ctx, n.ID)
+	if err := p.repo.RecomputeNotificationStatus(ctx, n.ID); err != nil {
+		notificationmetrics.IncError("recompute_status")
+		return err
+	}
 	notificationmetrics.IncError("delivery_permanent")
+	notificationmetrics.IncDelivery(string(delivery.Channel), "permanent_failed")
 	if p.dlq != nil {
 		_ = p.dlq.PublishToDLQ(ctx, n.Priority, notificationdto.QueueJob{
 			NotificationID: n.ID.String(),
@@ -201,12 +215,24 @@ func (p *Processor) failPermanent(ctx context.Context, n entity.Notification, de
 	return nil
 }
 
+// failPermanentClaimed handles the (should-be-impossible) case where a
+// claimed delivery's notification_id does not match the job: we still
+// hold the "sending" claim, so mark it permanently failed directly rather
+// than looking up the (wrong) notification.
+func (p *Processor) failPermanentClaimed(ctx context.Context, delivery entity.Delivery, msg string) error {
+	delivery.Status = entity.DeliveryPermanentFailed
+	delivery.Error = &msg
+	return p.repo.UpdateDelivery(ctx, delivery)
+}
+
 func (p *Processor) failTemporary(ctx context.Context, n entity.Notification, delivery entity.Delivery, job notificationdto.QueueJob, attempt int, msg string) error {
 	nextAttempt := attempt + 1
 	delivery.Status = entity.DeliveryFailed
 	delivery.Error = &msg
-	delivery.Attempts = nextAttempt
-	_ = p.repo.UpdateDelivery(ctx, delivery)
+	if err := p.repo.UpdateDelivery(ctx, delivery); err != nil {
+		notificationmetrics.IncError("update_delivery")
+		return err
+	}
 
 	if nextAttempt >= p.maxRetries {
 		return p.failPermanent(ctx, n, delivery, "max retries exceeded: "+msg)
@@ -214,12 +240,20 @@ func (p *Processor) failTemporary(ctx context.Context, n entity.Notification, de
 
 	job.Attempt = nextAttempt
 	notificationmetrics.IncRetry(string(delivery.Channel), string(n.Priority))
+	notificationmetrics.IncDelivery(string(delivery.Channel), "temporary_failed")
 	if err := p.publisher.Publish(ctx, n.Priority, job); err != nil {
 		notificationmetrics.IncError("retry_publish")
 		return err
 	}
-	_ = p.repo.RecomputeNotificationStatus(ctx, n.ID)
-	return nil
+	return p.repo.RecomputeNotificationStatus(ctx, n.ID)
+}
+
+// RecoverStuckDeliveries resets deliveries stuck in 'sending' longer than
+// timeout back to 'failed' so a future retry/claim can pick them up again
+// (e.g. after a worker crash mid-send). Intended to be called
+// periodically from cmd/worker.
+func (p *Processor) RecoverStuckDeliveries(ctx context.Context, timeout time.Duration) (int64, error) {
+	return p.repo.RecoverStuckSending(ctx, timeout)
 }
 
 func sanitizeErr(err error) string {

@@ -9,8 +9,8 @@ networks:
 services:
   notification-api:
     build:
-      context: .
-      dockerfile: Dockerfile
+      context: ..
+      dockerfile: notification-service/Dockerfile
       target: api
     container_name: ${CONTAINER_NAME_API:-notification-api}
     restart: unless-stopped
@@ -32,8 +32,8 @@ services:
 
   notification-worker-high:
     build:
-      context: .
-      dockerfile: Dockerfile
+      context: ..
+      dockerfile: notification-service/Dockerfile
       target: worker
     container_name: ${CONTAINER_NAME_WORKER_HIGH:-notification-worker-high}
     restart: unless-stopped
@@ -48,8 +48,8 @@ services:
 
   notification-worker-normal:
     build:
-      context: .
-      dockerfile: Dockerfile
+      context: ..
+      dockerfile: notification-service/Dockerfile
       target: worker
     container_name: ${CONTAINER_NAME_WORKER_NORMAL:-notification-worker-normal}
     restart: unless-stopped
@@ -63,8 +63,8 @@ services:
 
   notification-worker-low:
     build:
-      context: .
-      dockerfile: Dockerfile
+      context: ..
+      dockerfile: notification-service/Dockerfile
       target: worker
     container_name: ${CONTAINER_NAME_WORKER_LOW:-notification-worker-low}
     restart: unless-stopped
@@ -75,3 +75,16 @@ services:
       CONFIG_PATH: /app/config.yml
       QUEUES: low
     command: ["/app/notification-worker", "-queues=low"]
+
+  notification-outbox:
+    build:
+      context: ..
+      dockerfile: notification-service/Dockerfile
+      target: outbox
+    container_name: ${CONTAINER_NAME_OUTBOX:-notification-outbox}
+    restart: unless-stopped
+    networks: [infra-net]
+    env_file:
+      - .env
+    environment:
+      CONFIG_PATH: /app/config.yml

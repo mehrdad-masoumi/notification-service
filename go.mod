@@ -11,7 +11,8 @@ require (
 	github.com/knadh/koanf/providers/file v1.2.0
 	github.com/knadh/koanf/v2 v2.3.0
 	github.com/labstack/echo/v4 v4.13.4
-	github.com/mehrdad-masoumi/go-packages v0.0.0
+	github.com/lib/pq v1.10.9
+	github.com/mehrdad-masoumi/go-packages v0.1.0
 	github.com/prometheus/client_golang v1.23.2
 	github.com/rabbitmq/amqp091-go v1.10.0
 	github.com/stretchr/testify v1.11.1
@@ -29,7 +30,6 @@ require (
 	github.com/knadh/koanf/maps v0.1.2 // indirect
 	github.com/labstack/echo-jwt/v4 v4.3.1 // indirect
 	github.com/labstack/gommon v0.4.2 // indirect
-	github.com/lib/pq v1.10.9 // indirect
 	github.com/mattn/go-colorable v0.1.14 // indirect
 	github.com/mattn/go-isatty v0.0.20 // indirect
 	github.com/mitchellh/copystructure v1.2.0 // indirect
@@ -52,3 +52,8 @@ require (
 	google.golang.org/protobuf v1.36.8 // indirect
 	gopkg.in/yaml.v3 v3.0.1 // indirect
 )
+
+// go-packages v0.1.0 has not been tagged/published yet; this replace lets
+// local builds and CI resolve it from the sibling checkout. Once v0.1.0 is
+// tagged and pushed, this replace can be dropped and `go get` used instead.
+replace github.com/mehrdad-masoumi/go-packages => ../go-packages
