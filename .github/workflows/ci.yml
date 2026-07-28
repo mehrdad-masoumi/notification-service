@@ -1,0 +1,109 @@
+name: notification-service
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+
+env:
+  GOTOOLCHAIN: local
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout notification-service
+        uses: actions/checkout@v4
+        with:
+          path: notification-service
+
+      - name: Checkout go-packages
+        uses: actions/checkout@v4
+        with:
+          repository: mehrdad-masoumi/go-packages
+          path: go-packages
+          token: ${{ secrets.GO_PACKAGES_TOKEN || github.token }}
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.24.2"
+          cache-dependency-path: notification-service/go.sum
+
+      - name: Install staticcheck
+        run: go install honnef.co/go/tools/cmd/staticcheck@latest
+
+      - name: Install govulncheck
+        run: go install golang.org/x/vuln/cmd/govulncheck@latest
+
+      - name: go test
+        working-directory: notification-service
+        run: go test ./...
+
+      - name: go test -race
+        working-directory: notification-service
+        run: go test -race ./...
+
+      - name: go vet
+        working-directory: notification-service
+        run: go vet ./...
+
+      - name: staticcheck
+        working-directory: notification-service
+        run: staticcheck ./...
+
+      - name: govulncheck
+        working-directory: notification-service
+        run: govulncheck ./...
+
+  docker:
+    runs-on: ubuntu-latest
+    needs: test
+    steps:
+      - name: Checkout notification-service
+        uses: actions/checkout@v4
+        with:
+          path: notification-service
+
+      - name: Checkout go-packages
+        uses: actions/checkout@v4
+        with:
+          repository: mehrdad-masoumi/go-packages
+          path: go-packages
+          token: ${{ secrets.GO_PACKAGES_TOKEN || github.token }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build api image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: notification-service/Dockerfile
+          target: api
+          push: false
+          tags: notification-api:ci
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Build worker image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: notification-service/Dockerfile
+          target: worker
+          push: false
+          tags: notification-worker:ci
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Build outbox image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: notification-service/Dockerfile
+          target: outbox
+          push: false
+          tags: notification-outbox:ci
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
