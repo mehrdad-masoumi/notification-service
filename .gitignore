@@ -1,0 +1,9 @@
+# Binaries / local
+/tmp/
+*.exe
+*.test
+.env
+
+# IDE
+.idea/
+.vscode/

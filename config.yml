@@ -1,0 +1,66 @@
+application:
+  env: development
+  http_server:
+    url: 0.0.0.0
+    port: "8080"
+
+postgres:
+  host: infra-postgres
+  port: 5432
+  user: notification
+  password: notification
+  db: notifications
+  ssl: disable
+
+rabbitmq:
+  user: guest
+  password: guest
+  host: infra-rabbitmq
+  port: 5672
+  vhost: /
+
+auth:
+  access_secret: change-me-access-secret
+  admin_roles:
+    - admin
+    - super_admin
+
+internal_api_key: change-me-internal-api-key
+
+email:
+  host: ""
+  port: 587
+  username: ""
+  password: ""
+  from: noreply@example.com
+
+sms:
+  provider: noop
+  api_key: ""
+  from: ""
+  enabled: false
+
+whatsapp:
+  provider: noop
+  api_key: ""
+  from: ""
+  enabled: false
+
+worker:
+  queues:
+    - high
+    - normal
+    - low
+  concurrency: 4
+  prefetch: 10
+  max_retries: 5
+  health_port: "8081"
+
+user_service:
+  base_url: ""
+  api_key: ""
+  timeout: 5s
+
+scheduler:
+  interval_seconds: 30
+  batch_size: 100

@@ -1,0 +1,71 @@
+groups:
+  - name: notification
+    interval: 30s
+    rules:
+      - alert: NotificationDeliveryErrorRateWarning
+        expr: |
+          (
+            sum(increase(notification_delivery_duration_seconds_count{result=~"temporary_error|permanent_error"}[5m]))
+            /
+            clamp_min(sum(increase(notification_delivery_duration_seconds_count[5m])), 1)
+          ) > 0.10
+          and
+          sum(increase(notification_delivery_duration_seconds_count[5m])) >= 3
+        for: 30s
+        labels:
+          severity: warning
+          service: notification
+          env: dev
+        annotations:
+          summary: "Notification delivery error rate is elevated"
+          description: >-
+            Notification delivery error rate is {{ humanizePercentage $value }}
+            over the last 5 minutes.
+            Threshold: 10%.
+
+      - alert: NotificationDeliveryErrorRateCritical
+        expr: |
+          (
+            sum(increase(notification_delivery_duration_seconds_count{result=~"temporary_error|permanent_error"}[5m]))
+            /
+            clamp_min(sum(increase(notification_delivery_duration_seconds_count[5m])), 1)
+          ) > 0.20
+          and
+          sum(increase(notification_delivery_duration_seconds_count[5m])) >= 3
+        for: 30s
+        labels:
+          severity: critical
+          service: notification
+          env: dev
+        annotations:
+          summary: "Notification delivery error rate is critical"
+          description: >-
+            Notification delivery error rate is {{ humanizePercentage $value }}
+            over the last 5 minutes.
+            Threshold: 20%.
+
+      - alert: NotificationErrorsSpike
+        expr: |
+          sum(increase(notification_errors_total[5m])) >= 5
+        for: 1m
+        labels:
+          severity: warning
+          service: notification
+          env: dev
+        annotations:
+          summary: "Notification errors spike detected"
+          description: >-
+            At least {{ $value }} notification errors in the last 5 minutes.
+
+      - alert: NotificationDLQSpike
+        expr: |
+          sum(increase(notification_dlq_total[5m])) >= 5
+        for: 1m
+        labels:
+          severity: warning
+          service: notification
+          env: dev
+        annotations:
+          summary: "Notification DLQ spike detected"
+          description: >-
+            At least {{ $value }} jobs sent to DLQ in the last 5 minutes.
