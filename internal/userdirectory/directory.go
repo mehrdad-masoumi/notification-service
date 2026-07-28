@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
-	"time"
 
 	"notification-service/config"
 	notificationcontract "notification-service/internal/notification/contract"
@@ -19,15 +18,11 @@ type HTTPDirectory struct {
 }
 
 func NewHTTP(cfg config.UserService) *HTTPDirectory {
-	timeout := cfg.Timeout
-	if timeout == 0 {
-		timeout = 5 * time.Second
-	}
 	return &HTTPDirectory{
 		baseURL: stringsTrimRight(cfg.BaseURL, "/"),
 		apiKey:  cfg.APIKey,
 		httpClient: &http.Client{
-			Timeout: timeout,
+			Timeout: cfg.Timeout(),
 		},
 	}
 }

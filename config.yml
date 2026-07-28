@@ -33,6 +33,7 @@ email:
   username: ""
   password: ""
   from: noreply@example.com
+  timeout_seconds: 10
 
 sms:
   provider: noop
@@ -45,6 +46,10 @@ whatsapp:
   api_key: ""
   from: ""
   enabled: false
+
+push:
+  enabled: false
+  provider: stub
 
 worker:
   queues:
@@ -59,8 +64,27 @@ worker:
 user_service:
   base_url: ""
   api_key: ""
-  timeout: 5s
+  timeout_seconds: 5
+  contacts_path_format: "/internal/users/%s/notification-contacts"
 
 scheduler:
   interval_seconds: 30
   batch_size: 100
+
+outbox:
+  batch_size: 50
+  poll_interval_ms: 500
+  lock_timeout_seconds: 60
+  health_port: "8082"
+  max_attempts: 20
+
+retention:
+  outbox_days: 7
+  idempotency_hours: 24
+  cleanup_interval_minutes: 60
+
+direct_notification:
+  rate_limit_per_minute: 60
+
+batch:
+  sync_max_recipients: 100
