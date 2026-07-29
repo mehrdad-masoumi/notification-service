@@ -5,39 +5,6 @@ import (
 	"time"
 )
 
-// AdminCreateRequest is the legacy free-text admin fan-out request.
-type AdminCreateRequest struct {
-	Title       string                 `json:"title"`
-	Message     string                 `json:"message"`
-	UserIDs     []string               `json:"user_ids"`
-	Channels    []string               `json:"channels"`
-	Priority    string                 `json:"priority"`
-	Type        string                 `json:"type"`
-	ActionURL   string                 `json:"action_url"`
-	Payload     map[string]interface{} `json:"payload"`
-	ScheduledAt *time.Time             `json:"scheduled_at"`
-	Email       string                 `json:"email"`
-	Phone       string                 `json:"phone"`
-}
-
-// InternalCreateRequest is the deprecated free-text internal request.
-// Kept working for backward compatibility; new integrations should use
-// CommandRequest against the /internal/v1/notifications endpoint.
-type InternalCreateRequest struct {
-	IdempotencyKey string                 `json:"idempotency_key"`
-	UserID         string                 `json:"user_id"`
-	Title          string                 `json:"title"`
-	Message        string                 `json:"message"`
-	Type           string                 `json:"type"`
-	Channels       []string               `json:"channels"`
-	Priority       string                 `json:"priority"`
-	ActionURL      string                 `json:"action_url"`
-	Payload        map[string]interface{} `json:"payload"`
-	ScheduledAt    *time.Time             `json:"scheduled_at"`
-	Email          string                 `json:"email"`
-	Phone          string                 `json:"phone"`
-}
-
 // Contacts is the caller-provided user contact snapshot used to route and
 // filter channels. Email/Phone must never be logged.
 type Contacts struct {
@@ -51,29 +18,25 @@ type Contacts struct {
 
 // CommandRequest is the v1 template-driven notification command.
 // Contacts must be supplied by the caller; this service does not look up users.
+// Envelope fields (MessageID, SourceService, …) mirror broker-contract metadata.
 type CommandRequest struct {
-	IdempotencyKey string         `json:"idempotency_key"`
-	UserID         string         `json:"user_id"`
-	TemplateCode   string         `json:"template_code"`
-	Locale         string         `json:"locale"`
-	Channels       []string       `json:"channels"`
-	Priority       string         `json:"priority"`
-	Variables      map[string]any `json:"variables"`
-	ActionURL      string         `json:"action_url"`
-	ScheduledAt    *time.Time     `json:"scheduled_at"`
-	Contacts       *Contacts      `json:"contacts"`
-}
-
-// DirectCommandRequest sends a single-channel notification to an explicit
-// recipient (email/phone) for OTP / pre-user flows.
-type DirectCommandRequest struct {
-	IdempotencyKey string         `json:"idempotency_key"`
-	TemplateCode   string         `json:"template_code"`
-	Locale         string         `json:"locale"`
-	Channel        string         `json:"channel"`
-	Recipient      string         `json:"recipient"`
-	Variables      map[string]any `json:"variables"`
-	Priority       string         `json:"priority"`
+	IdempotencyKey string            `json:"idempotency_key"`
+	UserID         string            `json:"user_id"`
+	TemplateCode   string            `json:"template_code"`
+	Locale         string            `json:"locale"`
+	Channels       []string          `json:"channels"`
+	Priority       string            `json:"priority"`
+	Variables      map[string]any    `json:"variables"`
+	ActionURL      string            `json:"action_url"`
+	ScheduledAt    *time.Time        `json:"scheduled_at"`
+	Contacts       *Contacts         `json:"contacts"`
+	MessageID      string            `json:"message_id,omitempty"`
+	SourceService  string            `json:"source_service,omitempty"`
+	CorrelationID  string            `json:"correlation_id,omitempty"`
+	TraceID        string            `json:"trace_id,omitempty"`
+	Metadata       map[string]string `json:"metadata,omitempty"`
+	DeviceTokens   []string          `json:"device_tokens,omitempty"`
+	DisplayName    string            `json:"display_name,omitempty"`
 }
 
 type AcceptedResponse struct {

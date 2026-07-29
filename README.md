@@ -5,24 +5,31 @@ Template-driven multi-channel notification microservice (In-App, Email, SMS, Wha
 Adding a new domain notification (Withdrawal, Deposit, KYC, …) requires **only**:
 
 1. Inserting templates for the needed `code` / `locale` / `channel`
-2. Calling `POST /internal/v1/notifications` with `template_code` + `variables` from the caller service
+2. Sending a `notification.requested.v1` command (gRPC or RabbitMQ) with `template_code` + `variables` + recipient contacts
 
 No new consumers, handlers, or domain imports inside this service.
 
+**Preferred ingress for other services:** gRPC or RabbitMQ via [`../broker-contract`](../broker-contract) (`notification.requested.v1`).  
+**Admin panel:** `POST /admin/v1/notifications` (template-driven).  
+
 ## Architecture
 
-The API never publishes to RabbitMQ. Acceptance is durable: notification + deliveries + outbox rows are written in one Postgres transaction, then `202 Accepted` is returned. A separate **outbox publisher** claims rows with `FOR UPDATE SKIP LOCKED` and publishes with confirms.
+All transports enter the same **application command service**. Acceptance is durable: notification + deliveries + outbox rows are written in one Postgres transaction, then `Accepted` is returned. The API never publishes delivery jobs to RabbitMQ — a separate **outbox publisher** claims rows with `FOR UPDATE SKIP LOCKED` and publishes with confirms.
 
 ```mermaid
 flowchart TB
     subgraph callers ["Callers"]
         otherSvc["Other microservices"]
-        clients["Admin / User clients"]
+        adminUI["Admin panel"]
+        clients["User clients"]
     end
 
-    subgraph apiProc ["cmd/api :8080"]
+    subgraph apiProc ["cmd/api :8080 / :9090"]
         httpAPI["HTTP API"]
+        grpcAPI["gRPC SendNotification"]
+        rmqCmd["RabbitMQ command consumer"]
         scheduler["Scheduler + cleanup"]
+        appCmd["Application CommandService"]
     end
 
     subgraph outboxProc ["cmd/outbox :8082"]
@@ -40,6 +47,7 @@ flowchart TB
     end
 
     subgraph mq ["RabbitMQ"]
+        cmdEx["notification.commands"]
         qHigh["notification.high"]
         qNormal["notification.normal"]
         qLow["notification.low"]
@@ -54,12 +62,19 @@ flowchart TB
         push["push"]
     end
 
-    otherSvc -->|"POST /internal/v1/* + X-Internal-Api-Key"| httpAPI
-    clients -->|"JWT admin / user routes"| httpAPI
+    otherSvc -->|"gRPC :9090"| grpcAPI
+    otherSvc -->|"publish notification.requested.v1"| cmdEx
+    cmdEx --> rmqCmd
+    adminUI -->|"POST /admin/v1/* + JWT"| httpAPI
+    clients -->|"JWT user routes"| httpAPI
 
-    httpAPI -->|"validate → idempotency → render"| templates
-    httpAPI -->|"single TX → 202 Accepted"| notifTables
-    httpAPI --> outboxTable
+    grpcAPI --> appCmd
+    rmqCmd --> appCmd
+    httpAPI --> appCmd
+
+    appCmd -->|"validate → idempotency → render"| templates
+    appCmd -->|"single TX → Accepted"| notifTables
+    appCmd --> outboxTable
     scheduler --> notifTables
 
     outboxPub -->|"FOR UPDATE SKIP LOCKED"| outboxTable
@@ -82,17 +97,19 @@ flowchart TB
 ```mermaid
 sequenceDiagram
     participant Caller as Other service
-    participant API as Notification API
+    participant Ingress as gRPC / Rabbit / Admin HTTP
+    participant App as CommandService
     participant PG as Postgres
     participant Outbox as cmd/outbox
-    participant RMQ as RabbitMQ
+    participant RMQ as RabbitMQ delivery
     participant Worker as cmd/worker
     participant Prov as Providers
 
-    Caller->>API: POST /internal/v1/notifications
-    API->>API: validate + idempotency claim
-    API->>PG: TX notification + deliveries + outbox
-    API-->>Caller: 202 Accepted
+    Caller->>Ingress: notification.requested.v1
+    Ingress->>App: Send
+    App->>App: validate + idempotency claim
+    App->>PG: TX notification + deliveries + outbox
+    App-->>Caller: Accepted (notification_id)
 
     Outbox->>PG: claim outbox rows
     Outbox->>RMQ: publish notification.priority
@@ -104,70 +121,111 @@ sequenceDiagram
     Worker->>PG: mark sent / retry / DLQ
 ```
 
+- Contract source of truth: [`../broker-contract`](../broker-contract) (proto + JSON Schema). Callers must supply full recipient contacts; this service does **not** call User Service.
 - Templates live in `notification_templates` (`{{amount}}`-style placeholders only; no code execution).
-- Contacts for user-targeted commands are supplied by the caller in `contacts` (email, phone, locale, verified flags, preferences); this service does not call User Service.
-- OTP / pre-user flows use `POST /internal/v1/direct-notifications` with an explicit recipient.
+- OTP / pre-user flows: use gRPC/Rabbit with email/SMS recipient (no `user_id`).
 - Scheduled notifications stay hidden from the user inbox until `scheduled_at`.
 - SMS / WhatsApp / Push are accepted in validation only when the provider is actually configured (`Ready()`).
 
-Queues: `notification.high`, `notification.normal`, `notification.low` (+ matching `.dlq`).
+**Delivery queues:** `notification.high`, `notification.normal`, `notification.low` (+ matching `.dlq`).
+
+**Command ingress (RabbitMQ):**
+
+| Resource | Name |
+|----------|------|
+| Exchange | `notification.commands` |
+| Routing key | `notification.requested.v1` |
+| Queue | `notification-service.requested.v1` |
+| DLX / DLQ | `notification.dlx` / `notification-service.requested.v1.dlq` |
 
 ## Processes
 
 | Binary | Role | Default health |
 |--------|------|----------------|
-| `cmd/api` | HTTP API, migrations, scheduler, idempotency cleanup | `:8080` |
-| `cmd/outbox` | Outbox → RabbitMQ publisher | `:8082` |
-| `cmd/worker` | Consume priority queues | `:8081` |
+| `cmd/api` | HTTP API, migrations, scheduler, idempotency cleanup; optional gRPC (`:9090`) + RabbitMQ command consumer | `:8080` |
+| `cmd/outbox` | Outbox → RabbitMQ delivery publisher | `:8082` |
+| `cmd/worker` | Consume priority delivery queues | `:8081` |
 
-API readiness checks Postgres only (broker outage must not restart-loop the API). Outbox and workers also check RabbitMQ.
+API readiness checks Postgres only (broker outage must not restart-loop the API). Outbox and workers also check RabbitMQ. gRPC exposes standard gRPC health when enabled.
 
 ## Layout
 
 ```text
-cmd/api                         HTTP + scheduler + cleanup
-cmd/worker                      Queue consumers
-cmd/outbox                      Outbox publisher
-internal/notification/          http / service / repo / validator / dto / entity / metrics
-internal/notification/template  safe {{var}} renderer
-internal/outbox                 publisher loop used by cmd/outbox
-internal/provider               email / sms / whatsapp / inapp / push
-internal/queue                  RabbitMQ (confirms, mandatory, reconnect)
-migrations/postgres             sql-migrate (Up/Down)
-infra/grafana | prometheus      dashboards & alerts
+cmd/api                              HTTP + gRPC + command consumer + scheduler
+cmd/worker                           Delivery queue consumers
+cmd/outbox                           Outbox publisher
+internal/application/notification    Shared CommandService (all transports)
+internal/transport/                  grpc / http (admin v1) / rabbitmq consumer
+internal/notification/               http / service / repo / validator / dto / entity / metrics
+internal/notification/template       safe {{var}} renderer
+internal/outbox                      publisher loop used by cmd/outbox
+internal/provider                    email / sms / whatsapp / inapp / push
+internal/queue                       RabbitMQ delivery (confirms, mandatory, reconnect)
+migrations/postgres                  sql-migrate (Up/Down)
+infra/grafana | prometheus           dashboards & alerts
 ```
 
-Shared libs: [`../go-packages`](../go-packages) (`apperr`, `auth`, `db`, `httpserver`, `notificationclient`).
+Shared modules:
 
-Local module resolution:
+- [`../broker-contract`](../broker-contract) — `notification.requested.v1` proto + JSON Schema
+- [`../go-packages`](../go-packages) — `apperr`, `auth`, `db`, `httpserver`
+
+Local module resolution (see `go.mod`):
 
 ```go
+replace github.com/mehrdad-masoumi/broker-contract => ../broker-contract
 replace github.com/mehrdad-masoumi/go-packages => ../go-packages
 ```
 
-## APIs
+## Transports (preferred)
 
-### Internal (`X-Internal-Api-Key`)
+### gRPC — sync accept
+
+Use when you need `notification_id` immediately, sync validation errors, or OTP/security flows.
+
+```text
+notification.v1.NotificationService/SendNotification
+```
+
+Default listen: `:9090` (`transport.grpc`). In Docker, do **not** publish `9090` on the public host — reach via Traefik `grpc-internal` (see `.env.example`).
+
+### RabbitMQ — async command
+
+Use when the producer must not depend on Notification Service availability at call time.
+
+- Body: JSON matching `notification.requested.v1` (see broker-contract schema)
+- Content-Type: `application/json`
+- Topology: table above (`transport.rabbitmq`)
+
+Both share the same semantic contract and the same durable outcome inside `CommandService`. Details and examples: [`../broker-contract/README.md`](../broker-contract/README.md).
+
+### Choosing transport
+
+| Prefer | When |
+|--------|------|
+| **gRPC** | Need Accepted + `notification_id`; OTP / security; sync validation |
+| **RabbitMQ** | Fire-and-forget after your own outbox; buffering / throughput |
+| **Admin HTTP** | Admin panel UI only (`/admin/v1`) |
+
+## HTTP APIs
+
+### Admin v1 (JWT + admin role) — preferred admin create
+
+Enabled when `transport.http.enabled` (default `true`).
 
 | Method | Path | Notes |
 |--------|------|--------|
-| `POST` | `/internal/v1/notifications` | Template command for a `user_id` → `202` |
-| `POST` | `/internal/v1/direct-notifications` | One channel + explicit `recipient` (OTP, etc.) |
-| `POST` | `/internal/notifications` | **Deprecated** content-based create; still uses outbox |
+| `POST` | `/admin/v1/notifications` | Template create for one recipient → `202` |
+| `POST` | `/admin/v1/notification-batches` | Fan-out to `recipients[]` → `202` |
+| `GET` | `/admin/v1/notifications` | List |
+| `GET` | `/admin/v1/notifications/:id` | Detail + deliveries |
+| `GET` | `/admin/v1/notification-batches/:batch_id` | Batch detail |
+| `POST` | `/admin/v1/notification-templates` | Template CRUD |
+| `GET` | `/admin/v1/notification-templates` | Filters: `code`, `locale`, `channel`, `enabled` |
+| `GET` | `/admin/v1/notification-templates/:id` | |
+| `PUT` | `/admin/v1/notification-templates/:id` | |
+| `PATCH` | `/admin/v1/notification-templates/:id/status` | |
 
-### Admin (JWT + admin role)
-
-| Method | Path |
-|--------|------|
-| `POST` | `/admin/notifications` |
-| `GET` | `/admin/notifications` |
-| `GET` | `/admin/notifications/:id` |
-| `GET` | `/admin/notification-batches/:batch_id` |
-| `POST` | `/admin/notification-templates` |
-| `GET` | `/admin/notification-templates` (filters: `code`, `locale`, `channel`, `enabled`) |
-| `GET` | `/admin/notification-templates/:id` |
-| `PUT` | `/admin/notification-templates/:id` |
-| `PATCH` | `/admin/notification-templates/:id/status` |
 
 ### User (JWT; `user_id` from token)
 
@@ -184,113 +242,81 @@ replace github.com/mehrdad-masoumi/go-packages => ../go-packages
 - `GET /ready`
 - `GET /metrics` (also on worker `:8081` and outbox `:8082`)
 
-## Sample: template command (preferred)
+## Sample: contract command (preferred)
 
-```http
-POST /internal/v1/notifications
-X-Internal-Api-Key: change-me-internal-api-key
-Content-Type: application/json
+Semantic twin for gRPC protobuf and RabbitMQ JSON:
 
+```json
 {
+  "version": "v1",
+  "message_id": "550e8400-e29b-41d4-a716-446655440000",
   "idempotency_key": "withdrawal:123:approved",
-  "user_id": "11111111-1111-1111-1111-111111111111",
+  "source_service": "withdrawal-service",
   "template_code": "withdrawal_approved",
   "locale": "fa",
-  "channels": ["in_app", "email"],
-  "priority": "high",
-  "contacts": {
+  "recipient": {
+    "user_id": "11111111-1111-1111-1111-111111111111",
     "email": "user@example.com",
     "phone": "+49123456789",
-    "locale": "fa",
-    "email_verified": true,
-    "phone_verified": true,
-    "preferences": { "email": true, "sms": true, "whatsapp": false }
+    "display_name": "Mehrdad"
   },
+  "channels": ["in_app", "email"],
   "variables": {
     "amount": "1200",
     "currency": "USDT",
     "withdrawal_id": "123"
   },
-  "action_url": "/withdrawals/123",
+  "metadata": {
+    "withdrawal_id": "123"
+  },
   "scheduled_at": null
 }
 ```
 
 Rules:
 
-- `idempotency_key` required (max 255); same key + different body → `409`
-- `contacts` required (email/phone may be empty when only `in_app` / `push` are used)
-- `locale` defaults to `contacts.locale`, then `fa`
-- empty `channels` → channels from enabled templates for that code
-- empty `priority` → template `default_priority`, then `normal`
-- response after durable write only — does not wait for provider send
+- `idempotency_key` required; same key + different body → conflict / `409`
+- caller supplies full `recipient` contacts (email/phone may be empty when only `in_app` / `push`)
+- empty `channels` → derived from enabled templates for that code (where applicable)
+- response after durable write only — does **not** wait for provider send
+
+For financial / security operations, write to the **caller's own transactional outbox**, then publish to `notification.requested.v1` or call gRPC after commit.
+
+## Sample: Admin v1 create
+
+```http
+POST /admin/v1/notifications
+Authorization: Bearer <admin-jwt>
+Content-Type: application/json
+
+{
+  "idempotency_key": "admin:campaign:42:user:11111111-1111-1111-1111-111111111111",
+  "template_code": "system_announcement",
+  "locale": "fa",
+  "channels": ["in_app", "email"],
+  "priority": "normal",
+  "recipient": {
+    "user_id": "11111111-1111-1111-1111-111111111111",
+    "email": "user@example.com",
+    "phone": "+49123456789"
+  },
+  "variables": {
+    "title": "Maintenance",
+    "body": "Scheduled window tonight"
+  }
+}
+```
 
 `202 Accepted`:
 
 ```json
 {
-  "id": "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+  "notification_id": "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
   "status": "accepted"
 }
 ```
 
-## Sample: direct notification (OTP)
-
-```http
-POST /internal/v1/direct-notifications
-X-Internal-Api-Key: change-me-internal-api-key
-Content-Type: application/json
-
-{
-  "idempotency_key": "login-otp:request-123",
-  "template_code": "login_otp",
-  "locale": "fa",
-  "channel": "sms",
-  "recipient": "+49123456789",
-  "variables": { "code": "123456" }
-}
-```
-
-## Sample: caller client (`notificationclient`)
-
-```go
-import "github.com/mehrdad-masoumi/go-packages/notificationclient"
-
-client := notificationclient.New(notificationclient.Config{
-    BaseURL: "http://notification-api:8080",
-    APIKey:  os.Getenv("NOTIFICATION_INTERNAL_API_KEY"),
-    Timeout: 5 * time.Second,
-})
-
-_, err := client.Send(ctx, notificationclient.Command{
-    IdempotencyKey: "withdrawal:" + withdrawal.ID.String() + ":approved",
-    UserID:         withdrawal.UserID.String(),
-    TemplateCode:   "withdrawal_approved",
-    Priority:       "high",
-    ActionURL:      "/withdrawals/" + withdrawal.ID.String(),
-    Contacts: &notificationclient.Contacts{
-        Email:         user.Email,
-        Phone:         user.Phone,
-        Locale:        user.Locale,
-        EmailVerified: user.EmailVerified,
-        PhoneVerified: user.PhoneVerified,
-        Preferences:   user.NotificationPreferences,
-    },
-    Variables: map[string]any{
-        "amount":   withdrawal.Amount.String(),
-        "currency": withdrawal.Currency,
-    },
-})
-```
-
-**Do not** fire-and-forget:
-
-```go
-// BAD — drops errors and races with request context
-go notificationClient.Send(ctx, command)
-```
-
-For financial / security operations, write to the **caller's own transactional outbox**, then have a worker call `Send` after commit. See [`../go-packages/README.md`](../go-packages/README.md).
+Batch: `POST /admin/v1/notification-batches` with `recipients: [...]` → `{ "batch_id", "notification_id", "status": "accepted" }`.
 
 ## Config
 
@@ -306,9 +332,20 @@ Examples:
 | Env | Config path |
 |-----|-------------|
 | `NOTIFICATION_AUTH__ACCESS_SECRET` | `auth.access_secret` |
-| `NOTIFICATION_INTERNAL_API_KEY` | `internal_api_key` |
-| `NOTIFICATION_WORKER__MAX_RETRIES` | `worker.max_retries` |
+|| `NOTIFICATION_WORKER__MAX_RETRIES` | `worker.max_retries` |
 | `NOTIFICATION_OUTBOX__HEALTH_PORT` | `outbox.health_port` |
+| `NOTIFICATION_TRANSPORT__GRPC__ENABLED` | `transport.grpc.enabled` |
+| `NOTIFICATION_TRANSPORT__GRPC__ADDRESS` | `transport.grpc.address` |
+| `NOTIFICATION_TRANSPORT__RABBITMQ__ENABLED` | `transport.rabbitmq.enabled` |
+| `NOTIFICATION_TRANSPORT__HTTP__ENABLED` | `transport.http.enabled` |
+
+`transport` defaults (see `config.yml`):
+
+| Key | Default |
+|-----|---------|
+| `transport.grpc.enabled` / `address` | `true` / `:9090` |
+| `transport.rabbitmq.*` | command exchange/queue topology above |
+| `transport.http.enabled` | `true` (Admin v1 create routes) |
 
 In `production` / `prod`, placeholder secrets (`change-me-*`) cause fail-fast on startup. Secrets are never logged.
 
@@ -321,7 +358,7 @@ cd micro-service/notification-service
 cp .env.example .env
 go mod tidy
 
-# API (runs migrations)
+# API (migrations + HTTP; gRPC/Rabbit consumer if transport.* enabled)
 go run ./cmd/api
 
 # Outbox publisher (required for delivery)
@@ -335,7 +372,7 @@ go run ./cmd/worker -queues=low
 
 ## Docker
 
-Build context is the **parent** `micro-service/` directory (so `replace => ../go-packages` resolves).
+Build context is the **parent** `micro-service/` directory (so `replace => ../…` resolves).
 
 ```sql
 CREATE USER notification WITH PASSWORD 'notification';
@@ -350,7 +387,7 @@ docker compose -f docker-compose.dev.yml up --build
 
 Services: `notification-api`, `notification-outbox`, `notification-worker-{high,normal,low}`.
 
-Default host port: API `8191→8080`.
+Default host port: API HTTP `8191→8080`. gRPC `:9090` is **not** published on the host (Traefik `grpc-internal` only).
 
 ```bash
 docker compose -f docker-compose.dev.yml up --scale notification-worker-high=3
@@ -375,7 +412,7 @@ NOTIFICATION_TEST_POSTGRES_DSN='host=localhost user=notification password=notifi
   go test -tags=integration ./internal/notification/repository/...
 ```
 
-Unit coverage includes: config env mapping, template rendering, validators, backoff, provider disabled≠sent, registry `Ready()` gating, worker classification, `notificationclient` status mapping.
+Unit coverage includes: config env mapping, template rendering, validators, backoff, provider disabled≠sent, registry `Ready()` gating, worker classification, application command mapping.
 
 CI (`.github/workflows/ci.yml`): `go test`, `go test -race`, `go vet`, `staticcheck`, `govulncheck`, Docker builds for `api` / `worker` / `outbox`.
 
@@ -383,12 +420,15 @@ CI (`.github/workflows/ci.yml`): `go test`, `go test -race`, `go vet`, `staticch
 
 Metrics (low-cardinality labels only):
 
+- `notification_accepted_total` / `notification_enqueued_total`
 - `notification_commands_total`
 - `notification_outbox_pending` / `notification_outbox_publish_total` / `notification_outbox_oldest_pending_seconds`
 - `notification_delivery_total` / `notification_delivery_duration_seconds`
 - `notification_retry_total` / `notification_dlq_total`
+- `notification_scheduler_claimed_total`
 - `notification_template_render_errors_total`
 - `notification_idempotency_conflicts_total`
+- `notification_errors_total`
 
 Dashboard: [`infra/grafana/dashboards/notification.json`](infra/grafana/dashboards/notification.json)  
 Alerts: [`infra/prometheus/alerts/notification.yml`](infra/prometheus/alerts/notification.yml)

@@ -24,10 +24,22 @@ services:
     labels:
       - "traefik.enable=true"
       - "traefik.docker.network=web"
-      - "traefik.http.routers.${TRAEFIK_ROUTER_NAME}.rule=Host(`${TRAEFIK_HOST}`)"
+      - "traefik.http.routers.${TRAEFIK_ROUTER_NAME}.rule=Host(`${TRAEFIK_HOST}`) && PathPrefix(`/admin/v1`)"
       - "traefik.http.routers.${TRAEFIK_ROUTER_NAME}.entrypoints=${TRAEFIK_ENTRYPOINT}"
       - "traefik.http.routers.${TRAEFIK_ROUTER_NAME}.priority=${TRAEFIK_PRIORITY:-25}"
+      - "traefik.http.routers.${TRAEFIK_ROUTER_NAME}.service=${TRAEFIK_ROUTER_NAME}"
       - "traefik.http.services.${TRAEFIK_ROUTER_NAME}.loadbalancer.server.port=${TRAEFIK_SERVICE_PORT}"
+      - "traefik.http.routers.${TRAEFIK_ROUTER_NAME}-all.rule=Host(`${TRAEFIK_HOST}`)"
+      - "traefik.http.routers.${TRAEFIK_ROUTER_NAME}-all.entrypoints=${TRAEFIK_ENTRYPOINT}"
+      - "traefik.http.routers.${TRAEFIK_ROUTER_NAME}-all.priority=${TRAEFIK_PRIORITY_ALL:-20}"
+      - "traefik.http.routers.${TRAEFIK_ROUTER_NAME}-all.service=${TRAEFIK_ROUTER_NAME}"
+      - "traefik.http.routers.${TRAEFIK_GRPC_ROUTER_NAME}.rule=Host(`${TRAEFIK_GRPC_HOST}`)"
+      - "traefik.http.routers.${TRAEFIK_GRPC_ROUTER_NAME}.entrypoints=${TRAEFIK_GRPC_ENTRYPOINT}"
+      - "traefik.http.routers.${TRAEFIK_GRPC_ROUTER_NAME}.service=${TRAEFIK_GRPC_ROUTER_NAME}"
+      - "traefik.http.services.${TRAEFIK_GRPC_ROUTER_NAME}.loadbalancer.server.port=${TRAEFIK_GRPC_SERVICE_PORT:-9090}"
+      - "traefik.http.services.${TRAEFIK_GRPC_ROUTER_NAME}.loadbalancer.server.scheme=h2c"
+      - "traefik.http.routers.${TRAEFIK_GRPC_ROUTER_NAME}.middlewares=${TRAEFIK_GRPC_ALLOWLIST_MW:-notification-grpc-allowlist}"
+      - "traefik.http.middlewares.notification-grpc-allowlist.ipallowlist.sourcerange=${TRAEFIK_GRPC_ALLOW_CIDRS}"
     deploy:
       replicas: 2
 

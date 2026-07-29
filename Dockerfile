@@ -1,5 +1,5 @@
-# Build from micro-service/ so the sibling go-packages module is available
-# (notification-service go.mod uses: replace => ../go-packages).
+# Build from micro-service/ so sibling modules are available
+# (replace => ../go-packages, ../broker-contract).
 #
 #   docker build -f notification-service/Dockerfile --target api -t notification-api ..
 #
@@ -13,6 +13,7 @@ WORKDIR /src
 # ---------- Deps ----------
 FROM base AS deps
 COPY go-packages/go.mod go-packages/go.sum* ./go-packages/
+COPY broker-contract/go.mod broker-contract/go.sum* ./broker-contract/
 COPY notification-service/go.mod notification-service/go.sum* ./notification-service/
 WORKDIR /src/notification-service
 RUN --mount=type=cache,target=/go/pkg/mod \
@@ -22,6 +23,7 @@ RUN --mount=type=cache,target=/go/pkg/mod \
 FROM base AS builder
 COPY --from=deps /go/pkg/mod /go/pkg/mod
 COPY go-packages /src/go-packages
+COPY broker-contract /src/broker-contract
 COPY notification-service /src/notification-service
 WORKDIR /src/notification-service
 ENV CGO_ENABLED=0 GOOS=linux GOARCH=amd64
@@ -38,7 +40,7 @@ WORKDIR /app
 COPY --from=builder /out/notification-api /app/notification-api
 COPY --from=builder /src/notification-service/config.yml /app/config.yml
 COPY --from=builder /src/notification-service/migrations /app/migrations
-EXPOSE 8080
+EXPOSE 8080 9090
 HEALTHCHECK --interval=10s --timeout=3s --retries=3 \
   CMD wget -qO- http://127.0.0.1:8080/health-check || exit 1
 ENTRYPOINT ["/app/notification-api"]

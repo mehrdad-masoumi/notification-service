@@ -12,14 +12,13 @@ import (
 
 func TestEnvKeyMapper(t *testing.T) {
 	cases := map[string]string{
-		"NOTIFICATION_AUTH__ACCESS_SECRET":                        "auth.access_secret",
-		"NOTIFICATION_INTERNAL_API_KEY":                           "internal_api_key",
-		"NOTIFICATION_WORKER__MAX_RETRIES":                        "worker.max_retries",
-		"NOTIFICATION_APPLICATION__HTTP_SERVER__PORT":             "application.http_server.port",
-		"NOTIFICATION_APPLICATION__ENV":                           "application.env",
-		"NOTIFICATION_POSTGRES__HOST":                             "postgres.host",
-		"NOTIFICATION_OUTBOX__POLL_INTERVAL_MS":                   "outbox.poll_interval_ms",
-		"NOTIFICATION_DIRECT_NOTIFICATION__RATE_LIMIT_PER_MINUTE": "direct_notification.rate_limit_per_minute",
+		"NOTIFICATION_AUTH__ACCESS_SECRET":            "auth.access_secret",
+		"NOTIFICATION_WORKER__MAX_RETRIES":            "worker.max_retries",
+		"NOTIFICATION_APPLICATION__HTTP_SERVER__PORT": "application.http_server.port",
+		"NOTIFICATION_APPLICATION__ENV":               "application.env",
+		"NOTIFICATION_POSTGRES__HOST":                 "postgres.host",
+		"NOTIFICATION_OUTBOX__POLL_INTERVAL_MS":       "outbox.poll_interval_ms",
+		"NOTIFICATION_TRANSPORT__GRPC__ENABLED":       "transport.grpc.enabled",
 	}
 	for in, want := range cases {
 		require.Equal(t, want, config.EnvKeyMapper(in), in)
@@ -50,18 +49,15 @@ rabbitmq:
   vhost: /
 auth:
   access_secret: test-secret
-internal_api_key: test-key
 `), 0o600))
 
 	t.Setenv("NOTIFICATION_AUTH__ACCESS_SECRET", "from-env-secret")
-	t.Setenv("NOTIFICATION_INTERNAL_API_KEY", "from-env-key")
 	t.Setenv("NOTIFICATION_WORKER__MAX_RETRIES", "9")
 	t.Setenv("NOTIFICATION_APPLICATION__HTTP_SERVER__PORT", "9090")
 	t.Setenv("NOTIFICATION_POSTGRES__HOST", "pg-from-env")
 
 	cfg := config.LoadWithoutValidate(cfgPath)
 	require.Equal(t, "from-env-secret", cfg.Auth.AccessSecret)
-	require.Equal(t, "from-env-key", cfg.InternalAPIKey)
 	require.Equal(t, 9, cfg.Worker.MaxRetries)
 	require.Equal(t, "9090", cfg.Application.HTTPServer.Port)
 	require.Equal(t, "pg-from-env", cfg.Postgres.Host)
@@ -69,11 +65,10 @@ internal_api_key: test-key
 
 func TestValidateRejectsPlaceholderInProduction(t *testing.T) {
 	cfg := config.Config{
-		Application:    config.Application{Env: "production"},
-		Auth:           config.Auth{AccessSecret: "change-me-access-secret"},
-		InternalAPIKey: "change-me-internal-api-key",
-		Postgres:       config.Postgres{Host: "h", DB: "d"},
-		Rabbitmq:       config.Rabbitmq{Host: "r"},
+		Application: config.Application{Env: "production"},
+		Auth:        config.Auth{AccessSecret: "change-me-access-secret"},
+		Postgres:    config.Postgres{Host: "h", DB: "d"},
+		Rabbitmq:    config.Rabbitmq{Host: "r"},
 	}
 	err := cfg.Validate()
 	require.Error(t, err)
@@ -82,11 +77,10 @@ func TestValidateRejectsPlaceholderInProduction(t *testing.T) {
 
 func TestValidateAllowsPlaceholderInDevelopment(t *testing.T) {
 	cfg := config.Config{
-		Application:    config.Application{Env: "development"},
-		Auth:           config.Auth{AccessSecret: "change-me-access-secret"},
-		InternalAPIKey: "change-me-internal-api-key",
-		Postgres:       config.Postgres{Host: "h", DB: "d"},
-		Rabbitmq:       config.Rabbitmq{Host: "r"},
+		Application: config.Application{Env: "development"},
+		Auth:        config.Auth{AccessSecret: "change-me-access-secret"},
+		Postgres:    config.Postgres{Host: "h", DB: "d"},
+		Rabbitmq:    config.Rabbitmq{Host: "r"},
 	}
 	require.NoError(t, cfg.Validate())
 }

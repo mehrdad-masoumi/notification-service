@@ -12,11 +12,14 @@ require (
 	github.com/knadh/koanf/v2 v2.3.0
 	github.com/labstack/echo/v4 v4.13.4
 	github.com/lib/pq v1.10.9
+	github.com/mehrdad-masoumi/broker-contract v0.0.0
 	github.com/mehrdad-masoumi/go-packages v0.1.0
 	github.com/prometheus/client_golang v1.23.2
 	github.com/rabbitmq/amqp091-go v1.10.0
 	github.com/stretchr/testify v1.11.1
 	go.uber.org/fx v1.24.0
+	google.golang.org/grpc v1.71.0
+	google.golang.org/protobuf v1.36.8
 )
 
 require (
@@ -41,6 +44,7 @@ require (
 	github.com/prometheus/common v0.66.1 // indirect
 	github.com/prometheus/procfs v0.16.1 // indirect
 	github.com/rubenv/sql-migrate v1.8.0 // indirect
+	github.com/santhosh-tekuri/jsonschema/v5 v5.3.1 // indirect
 	github.com/valyala/bytebufferpool v1.0.0 // indirect
 	github.com/valyala/fasttemplate v1.2.2 // indirect
 	go.uber.org/dig v1.19.0 // indirect
@@ -53,7 +57,7 @@ require (
 	golang.org/x/sys v0.35.0 // indirect
 	golang.org/x/text v0.28.0 // indirect
 	golang.org/x/time v0.11.0 // indirect
-	google.golang.org/protobuf v1.36.8 // indirect
+	google.golang.org/genproto/googleapis/rpc v0.0.0-20250115164207-1a7da9e5054f // indirect
 	gopkg.in/yaml.v3 v3.0.1 // indirect
 )
 
@@ -61,3 +65,6 @@ require (
 // local builds and CI resolve it from the sibling checkout. Once v0.1.0 is
 // tagged and pushed, this replace can be dropped and `go get` used instead.
 replace github.com/mehrdad-masoumi/go-packages => ../go-packages
+
+// broker-contract is developed as a sibling module until published to GitHub.
+replace github.com/mehrdad-masoumi/broker-contract => ../broker-contract

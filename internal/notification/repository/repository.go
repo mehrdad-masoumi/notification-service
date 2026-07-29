@@ -268,26 +268,6 @@ func (r *Repository) GetByIdempotencyKey(ctx context.Context, key string) (entit
 	return mapNotification(row)
 }
 
-// CountRecentDirectByRecipient counts template_direct notifications sent to
-// the given recipient (email or phone) within the lookback window. Used for
-// OTP / direct-notification rate limiting.
-func (r *Repository) CountRecentDirectByRecipient(ctx context.Context, recipient string, within time.Duration) (int64, error) {
-	if recipient == "" {
-		return 0, nil
-	}
-	seconds := int64(within.Seconds())
-	if seconds < 1 {
-		seconds = 60
-	}
-	var count int64
-	err := r.db.GetContext(ctx, &count, `
-		SELECT COUNT(*) FROM notifications
-		WHERE type = 'template_direct'
-		  AND created_at > NOW() - ($2 * INTERVAL '1 second')
-		  AND (phone = $1 OR email = $1)`, recipient, seconds)
-	return count, err
-}
-
 func (r *Repository) UpdateNotificationStatus(ctx context.Context, id uuid.UUID, status entity.NotificationStatus) error {
 	_, err := r.db.ExecContext(ctx, `
 		UPDATE notifications SET status = $2, updated_at = NOW() WHERE id = $1`, id, status)

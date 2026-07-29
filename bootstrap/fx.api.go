@@ -11,28 +11,32 @@ import (
 	"github.com/mehrdad-masoumi/go-packages/auth"
 	"github.com/mehrdad-masoumi/go-packages/httpserver"
 	"notification-service/config"
+	application "notification-service/internal/application/notification"
 	adminhandler "notification-service/internal/notification/http/admin"
-	internalhandler "notification-service/internal/notification/http/internalapi"
-	internalv1handler "notification-service/internal/notification/http/internalapi/v1"
 	userhandler "notification-service/internal/notification/http/user"
 	notificationrepo "notification-service/internal/notification/repository"
 	notificationservice "notification-service/internal/notification/service"
 	notificationvalidator "notification-service/internal/notification/validator"
 	"notification-service/internal/scheduler"
+	grpctransport "notification-service/internal/transport/grpc"
+	httptransport "notification-service/internal/transport/http"
+	rabbitmqtransport "notification-service/internal/transport/rabbitmq"
 )
 
-// APIModule wires the notification HTTP API (plus in-process scheduler and cleanup).
+// APIModule wires the notification HTTP API (plus in-process scheduler, cleanup,
+// optional gRPC server, and optional RabbitMQ command consumer).
 var APIModule = fx.Options(
 	SharedModule,
 	fx.Provide(
 		provideValidator,
 		provideNotificationService,
+		provideCommandService,
 		provideAPIEcho,
 		userhandler.New,
 		adminhandler.New,
 		adminhandler.NewTemplatesHandler,
-		internalhandler.New,
-		internalv1handler.New,
+		httptransport.NewAdminHandler,
+		grpctransport.NewServer,
 		provideScheduler,
 	),
 	fx.Invoke(
@@ -40,6 +44,8 @@ var APIModule = fx.Options(
 		registerAPIRoutes,
 		startScheduler,
 		startIdempotencyCleanup,
+		startGRPCServer,
+		startRabbitConsumer,
 	),
 )
 
@@ -50,9 +56,12 @@ func provideValidator(cfg config.Config) notificationvalidator.Validator {
 func provideNotificationService(
 	repo *notificationrepo.Repository,
 	validator notificationvalidator.Validator,
-	cfg config.Config,
 ) *notificationservice.Service {
-	return notificationservice.New(repo, validator, cfg.DirectNotification.RateLimitPerMinute)
+	return notificationservice.New(repo, validator)
+}
+
+func provideCommandService(svc *notificationservice.Service) *application.CommandService {
+	return application.NewCommandService(svc)
 }
 
 func provideAPIEcho() *echo.Echo {
@@ -70,8 +79,7 @@ func registerAPIRoutes(
 	userH *userhandler.Handler,
 	adminH *adminhandler.Handler,
 	templatesH *adminhandler.TemplatesHandler,
-	internalH *internalhandler.Handler,
-	internalV1H *internalv1handler.Handler,
+	adminV1 *httptransport.AdminHandler,
 ) {
 	httpserver.RegisterMetrics(e)
 	httpserver.RegisterHealth(e,
@@ -80,17 +88,15 @@ func registerAPIRoutes(
 
 	jwtMW := auth.JWTMiddleware(cfg.Auth.AccessSecret)
 	adminMW := auth.RequireAdmin(cfg.Auth.AdminRoles)
-	internalMW := auth.InternalAPIKey(cfg.InternalAPIKey)
 
 	userH.Register(e.Group("/notifications", jwtMW))
 
-	adminH.Register(e.Group("/admin/notifications", jwtMW, adminMW))
-	adminH.RegisterBatches(e.Group("/admin/notification-batches", jwtMW, adminMW))
-	templatesH.Register(e.Group("/admin/notification-templates", jwtMW, adminMW))
-
-	// Deprecated: use /internal/v1/notifications instead.
-	internalH.Register(e.Group("/internal/notifications", internalMW))
-	internalV1H.Register(e.Group("/internal/v1", internalMW))
+	if cfg.Transport.HTTP.Enabled {
+		adminV1.Register(e.Group("/admin/v1", jwtMW, adminMW))
+		adminH.Register(e.Group("/admin/v1/notifications", jwtMW, adminMW))
+		adminH.RegisterBatches(e.Group("/admin/v1/notification-batches", jwtMW, adminMW))
+		templatesH.Register(e.Group("/admin/v1/notification-templates", jwtMW, adminMW))
+	}
 }
 
 func startScheduler(lc fx.Lifecycle, sched *scheduler.Scheduler) {
@@ -117,6 +123,58 @@ func startIdempotencyCleanup(lc fx.Lifecycle, svc *notificationservice.Service, 
 		OnStop: func(_ context.Context) error {
 			cancel()
 			return nil
+		},
+	})
+}
+
+func startGRPCServer(lc fx.Lifecycle, cfg config.Config, svc *grpctransport.Server) {
+	if !cfg.Transport.GRPC.Enabled {
+		return
+	}
+	runner := grpctransport.NewRunner(cfg.Transport.GRPC.Address, grpctransport.IsDevEnv(cfg.Application.Env), svc)
+	ctx, cancel := context.WithCancel(context.Background())
+	lc.Append(fx.Hook{
+		OnStart: func(_ context.Context) error {
+			go func() {
+				if err := runner.Start(ctx); err != nil && ctx.Err() == nil {
+					log.Printf("grpc server stopped: %v", err)
+				}
+			}()
+			return nil
+		},
+		OnStop: func(stopCtx context.Context) error {
+			cancel()
+			return runner.Stop(stopCtx)
+		},
+	})
+}
+
+func startRabbitConsumer(lc fx.Lifecycle, cfg config.Config, cmds *application.CommandService) {
+	if !cfg.Transport.RabbitMQ.Enabled {
+		return
+	}
+	consumer := rabbitmqtransport.NewConsumer(rabbitmqtransport.Config{
+		URI:        cfg.Rabbitmq.URI(),
+		Exchange:   cfg.Transport.RabbitMQ.Exchange,
+		RoutingKey: cfg.Transport.RabbitMQ.RoutingKey,
+		Queue:      cfg.Transport.RabbitMQ.Queue,
+		DLX:        cfg.Transport.RabbitMQ.DLX,
+		DLQ:        cfg.Transport.RabbitMQ.DLQ,
+		Prefetch:   cfg.Transport.RabbitMQ.Prefetch,
+	}, cmds)
+	ctx, cancel := context.WithCancel(context.Background())
+	lc.Append(fx.Hook{
+		OnStart: func(_ context.Context) error {
+			go func() {
+				if err := consumer.Start(ctx); err != nil && ctx.Err() == nil {
+					log.Printf("rabbitmq consumer stopped: %v", err)
+				}
+			}()
+			return nil
+		},
+		OnStop: func(stopCtx context.Context) error {
+			cancel()
+			return consumer.Stop(stopCtx)
 		},
 	})
 }

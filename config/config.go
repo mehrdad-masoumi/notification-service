@@ -10,7 +10,6 @@ type Config struct {
 	Postgres           Postgres           `koanf:"postgres"`
 	Rabbitmq           Rabbitmq           `koanf:"rabbitmq"`
 	Auth               Auth               `koanf:"auth"`
-	InternalAPIKey     string             `koanf:"internal_api_key"`
 	Email              Email              `koanf:"email"`
 	SMS                SMS                `koanf:"sms"`
 	WhatsApp           WhatsApp           `koanf:"whatsapp"`
@@ -19,8 +18,33 @@ type Config struct {
 	Scheduler          Scheduler          `koanf:"scheduler"`
 	Outbox             Outbox             `koanf:"outbox"`
 	Retention          Retention          `koanf:"retention"`
-	DirectNotification DirectNotification `koanf:"direct_notification"`
 	Batch              Batch              `koanf:"batch"`
+	Transport          Transport          `koanf:"transport"`
+}
+
+type Transport struct {
+	GRPC     TransportGRPC     `koanf:"grpc"`
+	RabbitMQ TransportRabbitMQ `koanf:"rabbitmq"`
+	HTTP     TransportHTTP     `koanf:"http"`
+}
+
+type TransportGRPC struct {
+	Enabled bool   `koanf:"enabled"`
+	Address string `koanf:"address"`
+}
+
+type TransportRabbitMQ struct {
+	Enabled    bool   `koanf:"enabled"`
+	Exchange   string `koanf:"exchange"`
+	RoutingKey string `koanf:"routing_key"`
+	Queue      string `koanf:"queue"`
+	DLX        string `koanf:"dlx"`
+	DLQ        string `koanf:"dlq"`
+	Prefetch   int    `koanf:"prefetch"`
+}
+
+type TransportHTTP struct {
+	Enabled bool `koanf:"enabled"`
 }
 
 type Application struct {
@@ -147,10 +171,6 @@ type Retention struct {
 	CleanupIntervalMinutes int `koanf:"cleanup_interval_minutes"`
 }
 
-type DirectNotification struct {
-	RateLimitPerMinute int `koanf:"rate_limit_per_minute"`
-}
-
 type Batch struct {
 	SyncMaxRecipients int `koanf:"sync_max_recipients"`
 }
@@ -187,9 +207,6 @@ func (c Config) Validate() error {
 	if strings.TrimSpace(c.Auth.AccessSecret) == "" {
 		missing = append(missing, "auth.access_secret")
 	}
-	if strings.TrimSpace(c.InternalAPIKey) == "" {
-		missing = append(missing, "internal_api_key")
-	}
 	if strings.TrimSpace(c.Postgres.Host) == "" {
 		missing = append(missing, "postgres.host")
 	}
@@ -202,9 +219,6 @@ func (c Config) Validate() error {
 	if c.IsProduction() {
 		if isPlaceholderSecret(c.Auth.AccessSecret) {
 			missing = append(missing, "auth.access_secret(placeholder)")
-		}
-		if isPlaceholderSecret(c.InternalAPIKey) {
-			missing = append(missing, "internal_api_key(placeholder)")
 		}
 	}
 	if len(missing) > 0 {

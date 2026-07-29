@@ -21,7 +21,6 @@ import (
 // Examples:
 //
 //	NOTIFICATION_AUTH__ACCESS_SECRET        → auth.access_secret
-//	NOTIFICATION_INTERNAL_API_KEY           → internal_api_key
 //	NOTIFICATION_WORKER__MAX_RETRIES        → worker.max_retries
 //	NOTIFICATION_APPLICATION__HTTP_SERVER__PORT → application.http_server.port
 func EnvKeyMapper(s string) string {
@@ -109,9 +108,6 @@ func applyDefaults(cfg *Config) {
 	if cfg.Retention.CleanupIntervalMinutes <= 0 {
 		cfg.Retention.CleanupIntervalMinutes = 60
 	}
-	if cfg.DirectNotification.RateLimitPerMinute <= 0 {
-		cfg.DirectNotification.RateLimitPerMinute = 60
-	}
 	if cfg.Batch.SyncMaxRecipients <= 0 {
 		cfg.Batch.SyncMaxRecipients = 100
 	}
@@ -123,5 +119,26 @@ func applyDefaults(cfg *Config) {
 	}
 	if cfg.Application.Env == "" {
 		cfg.Application.Env = "development"
+	}
+	if cfg.Transport.GRPC.Address == "" {
+		cfg.Transport.GRPC.Address = ":9090"
+	}
+	if cfg.Transport.RabbitMQ.Exchange == "" {
+		cfg.Transport.RabbitMQ.Exchange = "notification.commands"
+	}
+	if cfg.Transport.RabbitMQ.RoutingKey == "" {
+		cfg.Transport.RabbitMQ.RoutingKey = "notification.requested.v1"
+	}
+	if cfg.Transport.RabbitMQ.Queue == "" {
+		cfg.Transport.RabbitMQ.Queue = "notification-service.requested.v1"
+	}
+	if cfg.Transport.RabbitMQ.DLX == "" {
+		cfg.Transport.RabbitMQ.DLX = "notification.dlx"
+	}
+	if cfg.Transport.RabbitMQ.DLQ == "" {
+		cfg.Transport.RabbitMQ.DLQ = "notification-service.requested.v1.dlq"
+	}
+	if cfg.Transport.RabbitMQ.Prefetch <= 0 {
+		cfg.Transport.RabbitMQ.Prefetch = 10
 	}
 }

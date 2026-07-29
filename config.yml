@@ -25,8 +25,6 @@ auth:
     - admin
     - super_admin
 
-internal_api_key: change-me-internal-api-key
-
 email:
   host: ""
   port: 587
@@ -77,8 +75,20 @@ retention:
   idempotency_hours: 24
   cleanup_interval_minutes: 60
 
-direct_notification:
-  rate_limit_per_minute: 60
-
 batch:
   sync_max_recipients: 100
+
+transport:
+  grpc:
+    enabled: true
+    address: ":9090"
+  rabbitmq:
+    enabled: true
+    exchange: "notification.commands"
+    routing_key: "notification.requested.v1"
+    queue: "notification-service.requested.v1"
+    dlx: "notification.dlx"
+    dlq: "notification-service.requested.v1.dlq"
+    prefetch: 10
+  http:
+    enabled: true
