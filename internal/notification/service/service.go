@@ -11,14 +11,12 @@ import (
 
 	"github.com/google/uuid"
 
-	notificationcontract "notification-service/internal/notification/contract"
 	notificationdto "notification-service/internal/notification/dto"
 	"notification-service/internal/notification/entity"
 	notificationmetrics "notification-service/internal/notification/metrics"
 	notificationrepo "notification-service/internal/notification/repository"
 	notificationtemplate "notification-service/internal/notification/template"
 	notificationvalidator "notification-service/internal/notification/validator"
-	providerrerrors "notification-service/internal/provider"
 	"notification-service/pkg/sharederrors"
 
 	"github.com/mehrdad-masoumi/go-packages/apperr"
@@ -39,15 +37,13 @@ var channelPriorityOrder = []entity.Channel{
 type Service struct {
 	repo      *notificationrepo.Repository
 	validator notificationvalidator.Validator
-	users     notificationcontract.IFUserContacts
 }
 
 func New(
 	repo *notificationrepo.Repository,
 	validator notificationvalidator.Validator,
-	users notificationcontract.IFUserContacts,
 ) *Service {
-	return &Service{repo: repo, validator: validator, users: users}
+	return &Service{repo: repo, validator: validator}
 }
 
 func (s *Service) Repo() *notificationrepo.Repository {
@@ -70,6 +66,9 @@ func (s *Service) AcceptCommand(ctx context.Context, req notificationdto.Command
 	}
 
 	locale := req.Locale
+	if locale == "" && req.Contacts != nil && req.Contacts.Locale != "" {
+		locale = req.Contacts.Locale
+	}
 	if locale == "" {
 		locale = entity.DefaultLocale
 	}
@@ -89,22 +88,7 @@ func (s *Service) AcceptCommand(ctx context.Context, req notificationdto.Command
 		return notificationdto.AcceptedResponse{}, http.StatusBadRequest, apperr.New(op).WithKind(apperr.KindInvalid).WithMessage("invalid user_id")
 	}
 
-	contacts, err := s.users.ResolveContacts(ctx, req.UserID)
-	if err != nil {
-		_ = s.repo.FailIdempotency(ctx, req.IdempotencyKey)
-		notificationmetrics.IncError("resolve_contacts")
-		if providerrerrors.IsPermanent(err) {
-			// User-service 404 is permanent and must not be retried.
-			return notificationdto.AcceptedResponse{}, http.StatusNotFound, apperr.New(op).
-				WithKind(apperr.KindNotFound).
-				WithErr(err).
-				WithMessage("user not found")
-		}
-		return notificationdto.AcceptedResponse{}, http.StatusServiceUnavailable, apperr.New(op).
-			WithKind(apperr.KindUnexpected).
-			WithErr(err).
-			WithMessage("failed to resolve user contacts")
-	}
+	contacts := *req.Contacts
 
 	channels := toChannels(req.Channels)
 	if len(channels) == 0 {
@@ -180,6 +164,14 @@ func (s *Service) AcceptCommand(ctx context.Context, req notificationdto.Command
 		Locale:       locale,
 		Variables:    variablesJSON,
 	}
+	if contacts.Email != "" {
+		email := contacts.Email
+		n.Email = &email
+	}
+	if contacts.Phone != "" {
+		phone := contacts.Phone
+		n.Phone = &phone
+	}
 	key := req.IdempotencyKey
 	n.IdempotencyKey = &key
 
@@ -214,7 +206,7 @@ func (s *Service) AcceptCommand(ctx context.Context, req notificationdto.Command
 }
 
 // AcceptDirectCommand sends a single-channel notification to an explicit
-// recipient with no user lookup involved.
+// recipient (OTP / pre-user flows).
 func (s *Service) AcceptDirectCommand(ctx context.Context, req notificationdto.DirectCommandRequest) (notificationdto.AcceptedResponse, int, error) {
 	const op = "notification_service.AcceptDirectCommand"
 
@@ -1091,7 +1083,7 @@ func buildOutboxEvents(notificationID uuid.UUID, priority entity.Priority, deliv
 // filterChannelsByContacts drops channels the user cannot receive: opted
 // out via preferences, or missing/unverified contact info for
 // email/sms/whatsapp. in_app and push always pass through.
-func filterChannelsByContacts(channels []entity.Channel, contacts notificationcontract.Contacts) []entity.Channel {
+func filterChannelsByContacts(channels []entity.Channel, contacts notificationdto.Contacts) []entity.Channel {
 	out := make([]entity.Channel, 0, len(channels))
 	for _, ch := range channels {
 		if pref, ok := contacts.Preferences[string(ch)]; ok && !pref {

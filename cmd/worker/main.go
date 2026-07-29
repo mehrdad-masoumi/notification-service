@@ -14,12 +14,10 @@ import (
 	"github.com/mehrdad-masoumi/go-packages/db"
 	"github.com/mehrdad-masoumi/go-packages/httpserver"
 	"notification-service/config"
-	notificationcontract "notification-service/internal/notification/contract"
 	"notification-service/internal/notification/entity"
 	notificationrepo "notification-service/internal/notification/repository"
 	providerregistry "notification-service/internal/provider/registry"
 	"notification-service/internal/queue"
-	"notification-service/internal/userclient"
 	"notification-service/internal/worker"
 )
 
@@ -55,9 +53,8 @@ func main() {
 
 	repo := notificationrepo.New(sqlDB)
 	registry := providerregistry.New(cfg)
-	users := newUserClient(cfg)
 
-	processor := worker.NewProcessor(repo, registry, users, mq, cfg.Worker.MaxRetries, mq)
+	processor := worker.NewProcessor(repo, registry, mq, cfg.Worker.MaxRetries, mq)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -113,13 +110,6 @@ func main() {
 	defer shutdownCancel()
 	_ = e.Shutdown(shutdownCtx)
 	log.Println("worker stopped")
-}
-
-func newUserClient(cfg config.Config) notificationcontract.IFUserContacts {
-	if cfg.UserService.BaseURL == "" {
-		return userclient.Noop{}
-	}
-	return userclient.New(cfg.UserService)
 }
 
 // runStuckDeliveryRecovery periodically resets deliveries stuck in

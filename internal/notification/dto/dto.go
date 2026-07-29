@@ -38,7 +38,19 @@ type InternalCreateRequest struct {
 	Phone          string                 `json:"phone"`
 }
 
+// Contacts is the caller-provided user contact snapshot used to route and
+// filter channels. Email/Phone must never be logged.
+type Contacts struct {
+	Email         string          `json:"email"`
+	Phone         string          `json:"phone"`
+	Locale        string          `json:"locale"`
+	EmailVerified bool            `json:"email_verified"`
+	PhoneVerified bool            `json:"phone_verified"`
+	Preferences   map[string]bool `json:"preferences"`
+}
+
 // CommandRequest is the v1 template-driven notification command.
+// Contacts must be supplied by the caller; this service does not look up users.
 type CommandRequest struct {
 	IdempotencyKey string         `json:"idempotency_key"`
 	UserID         string         `json:"user_id"`
@@ -49,10 +61,11 @@ type CommandRequest struct {
 	Variables      map[string]any `json:"variables"`
 	ActionURL      string         `json:"action_url"`
 	ScheduledAt    *time.Time     `json:"scheduled_at"`
+	Contacts       *Contacts      `json:"contacts"`
 }
 
 // DirectCommandRequest sends a single-channel notification to an explicit
-// recipient (email/phone), bypassing user lookup entirely.
+// recipient (email/phone) for OTP / pre-user flows.
 type DirectCommandRequest struct {
 	IdempotencyKey string         `json:"idempotency_key"`
 	TemplateCode   string         `json:"template_code"`

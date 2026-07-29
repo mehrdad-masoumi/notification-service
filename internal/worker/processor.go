@@ -22,7 +22,6 @@ import (
 type Processor struct {
 	repo       *notificationrepo.Repository
 	registry   notificationcontract.IFProviderRegistry
-	users      notificationcontract.IFUserContacts
 	publisher  notificationcontract.IFPublisher
 	maxRetries int
 	dlq        *queue.Client
@@ -31,7 +30,6 @@ type Processor struct {
 func NewProcessor(
 	repo *notificationrepo.Repository,
 	registry notificationcontract.IFProviderRegistry,
-	users notificationcontract.IFUserContacts,
 	publisher notificationcontract.IFPublisher,
 	maxRetries int,
 	dlq *queue.Client,
@@ -39,7 +37,6 @@ func NewProcessor(
 	return &Processor{
 		repo:       repo,
 		registry:   registry,
-		users:      users,
 		publisher:  publisher,
 		maxRetries: maxRetries,
 		dlq:        dlq,
@@ -98,7 +95,7 @@ func (p *Processor) Handle(ctx context.Context, job notificationdto.QueueJob, at
 		return p.failPermanent(ctx, n, delivery, err.Error())
 	}
 
-	to, resolveErr := p.resolveRecipient(ctx, n, delivery.Channel)
+	to, resolveErr := p.resolveRecipient(n, delivery.Channel)
 	if resolveErr != nil {
 		if providerrerrors.IsPermanent(resolveErr) {
 			notificationmetrics.ObserveDelivery(string(delivery.Channel), "permanent_error", startedAt)
@@ -157,7 +154,7 @@ func (p *Processor) Handle(ctx context.Context, job notificationdto.QueueJob, at
 	return p.repo.RecomputeNotificationStatus(ctx, n.ID)
 }
 
-func (p *Processor) resolveRecipient(ctx context.Context, n entity.Notification, channel entity.Channel) (string, error) {
+func (p *Processor) resolveRecipient(n entity.Notification, channel entity.Channel) (string, error) {
 	switch channel {
 	case entity.ChannelInApp, entity.ChannelPush:
 		return n.UserID.String(), nil
@@ -165,26 +162,12 @@ func (p *Processor) resolveRecipient(ctx context.Context, n entity.Notification,
 		if n.Email != nil && *n.Email != "" {
 			return *n.Email, nil
 		}
-		contacts, err := p.users.ResolveContacts(ctx, n.UserID.String())
-		if err != nil {
-			return "", err
-		}
-		if contacts.Email == "" {
-			return "", providerrerrors.Permanent("email not available for user", nil)
-		}
-		return contacts.Email, nil
+		return "", providerrerrors.Permanent("email not available for notification", nil)
 	case entity.ChannelSMS, entity.ChannelWhatsApp:
 		if n.Phone != nil && *n.Phone != "" {
 			return *n.Phone, nil
 		}
-		contacts, err := p.users.ResolveContacts(ctx, n.UserID.String())
-		if err != nil {
-			return "", err
-		}
-		if contacts.Phone == "" {
-			return "", providerrerrors.Permanent("phone not available for user", nil)
-		}
-		return contacts.Phone, nil
+		return "", providerrerrors.Permanent("phone not available for notification", nil)
 	default:
 		return "", providerrerrors.Permanent("unsupported channel", nil)
 	}

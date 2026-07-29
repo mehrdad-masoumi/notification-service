@@ -15,7 +15,6 @@ func TestEnvKeyMapper(t *testing.T) {
 		"NOTIFICATION_AUTH__ACCESS_SECRET":                        "auth.access_secret",
 		"NOTIFICATION_INTERNAL_API_KEY":                           "internal_api_key",
 		"NOTIFICATION_WORKER__MAX_RETRIES":                        "worker.max_retries",
-		"NOTIFICATION_USER_SERVICE__BASE_URL":                     "user_service.base_url",
 		"NOTIFICATION_APPLICATION__HTTP_SERVER__PORT":             "application.http_server.port",
 		"NOTIFICATION_APPLICATION__ENV":                           "application.env",
 		"NOTIFICATION_POSTGRES__HOST":                             "postgres.host",
@@ -57,7 +56,6 @@ internal_api_key: test-key
 	t.Setenv("NOTIFICATION_AUTH__ACCESS_SECRET", "from-env-secret")
 	t.Setenv("NOTIFICATION_INTERNAL_API_KEY", "from-env-key")
 	t.Setenv("NOTIFICATION_WORKER__MAX_RETRIES", "9")
-	t.Setenv("NOTIFICATION_USER_SERVICE__BASE_URL", "http://users:8080")
 	t.Setenv("NOTIFICATION_APPLICATION__HTTP_SERVER__PORT", "9090")
 	t.Setenv("NOTIFICATION_POSTGRES__HOST", "pg-from-env")
 
@@ -65,7 +63,6 @@ internal_api_key: test-key
 	require.Equal(t, "from-env-secret", cfg.Auth.AccessSecret)
 	require.Equal(t, "from-env-key", cfg.InternalAPIKey)
 	require.Equal(t, 9, cfg.Worker.MaxRetries)
-	require.Equal(t, "http://users:8080", cfg.UserService.BaseURL)
 	require.Equal(t, "9090", cfg.Application.HTTPServer.Port)
 	require.Equal(t, "pg-from-env", cfg.Postgres.Host)
 }

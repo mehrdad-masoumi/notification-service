@@ -3,7 +3,6 @@ package config
 import (
 	"fmt"
 	"strings"
-	"time"
 )
 
 type Config struct {
@@ -17,7 +16,6 @@ type Config struct {
 	WhatsApp           WhatsApp           `koanf:"whatsapp"`
 	Push               Push               `koanf:"push"`
 	Worker             Worker             `koanf:"worker"`
-	UserService        UserService        `koanf:"user_service"`
 	Scheduler          Scheduler          `koanf:"scheduler"`
 	Outbox             Outbox             `koanf:"outbox"`
 	Retention          Retention          `koanf:"retention"`
@@ -128,28 +126,6 @@ type Worker struct {
 	Prefetch    int      `koanf:"prefetch"`
 	MaxRetries  int      `koanf:"max_retries"`
 	HealthPort  string   `koanf:"health_port"`
-}
-
-type UserService struct {
-	BaseURL            string `koanf:"base_url"`
-	APIKey             string `koanf:"api_key"`
-	TimeoutSeconds     int    `koanf:"timeout_seconds"`
-	ContactsPathFormat string `koanf:"contacts_path_format"`
-}
-
-func (u UserService) Timeout() time.Duration {
-	if u.TimeoutSeconds <= 0 {
-		return 5 * time.Second
-	}
-	return time.Duration(u.TimeoutSeconds) * time.Second
-}
-
-func (u UserService) ContactsPath(userID string) string {
-	format := u.ContactsPathFormat
-	if format == "" {
-		format = "/internal/users/%s/notification-contacts"
-	}
-	return fmt.Sprintf(format, userID)
 }
 
 type Scheduler struct {

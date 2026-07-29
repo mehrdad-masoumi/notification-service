@@ -97,7 +97,8 @@ func (v Validator) ValidateInternalCreate(req notificationdto.InternalCreateRequ
 
 // ValidateCommand validates the v1 template-driven command. Channels are
 // optional here: when omitted, the service derives them from the
-// templates registered for TemplateCode.
+// templates registered for TemplateCode. Contacts is required (email/phone
+// may be empty when only in_app/push are used).
 func (v Validator) ValidateCommand(req notificationdto.CommandRequest) (map[string]string, error) {
 	fields := map[string]string{}
 
@@ -109,6 +110,15 @@ func (v Validator) ValidateCommand(req notificationdto.CommandRequest) (map[stri
 	}
 	if err := validation.Validate(req.TemplateCode, validation.Required, validation.Length(1, 100)); err != nil {
 		fields["template_code"] = "validation.required.template_code"
+	}
+	if req.Contacts == nil {
+		fields["contacts"] = "validation.required.contacts"
+	} else {
+		if req.Contacts.Email != "" {
+			if err := validation.Validate(req.Contacts.Email, is.EmailFormat); err != nil {
+				fields["contacts.email"] = "validation.invalid.email"
+			}
+		}
 	}
 	if len(req.Channels) > 0 {
 		if errs := v.validateChannels(req.Channels, false); len(errs) > 0 {
@@ -128,7 +138,7 @@ func (v Validator) ValidateCommand(req notificationdto.CommandRequest) (map[stri
 }
 
 // ValidateDirectCommand validates the single-channel, explicit-recipient
-// command used for direct notifications (no user lookup).
+// command used for OTP / pre-user direct notifications.
 func (v Validator) ValidateDirectCommand(req notificationdto.DirectCommandRequest) (map[string]string, error) {
 	fields := map[string]string{}
 

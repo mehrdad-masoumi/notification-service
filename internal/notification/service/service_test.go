@@ -11,7 +11,6 @@ import (
 	notificationdto "notification-service/internal/notification/dto"
 	notificationservice "notification-service/internal/notification/service"
 	notificationvalidator "notification-service/internal/notification/validator"
-	"notification-service/internal/userclient"
 )
 
 var allEnabled = map[string]bool{
@@ -23,7 +22,7 @@ var allEnabled = map[string]bool{
 }
 
 func newTestService() *notificationservice.Service {
-	return notificationservice.New(nil, notificationvalidator.New(allEnabled), userclient.NewFake())
+	return notificationservice.New(nil, notificationvalidator.New(allEnabled))
 }
 
 func TestAdminCreate_ValidationError(t *testing.T) {
@@ -53,6 +52,7 @@ func TestAcceptCommand_ValidationError(t *testing.T) {
 	var ve *apperr.Error
 	require.ErrorAs(t, err, &ve)
 	require.Contains(t, ve.Fields, "template_code")
+	require.Contains(t, ve.Fields, "contacts")
 }
 
 func TestAcceptDirectCommand_ValidationError(t *testing.T) {

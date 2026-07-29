@@ -23,7 +23,6 @@ import (
 //	NOTIFICATION_AUTH__ACCESS_SECRET        → auth.access_secret
 //	NOTIFICATION_INTERNAL_API_KEY           → internal_api_key
 //	NOTIFICATION_WORKER__MAX_RETRIES        → worker.max_retries
-//	NOTIFICATION_USER_SERVICE__BASE_URL     → user_service.base_url
 //	NOTIFICATION_APPLICATION__HTTP_SERVER__PORT → application.http_server.port
 func EnvKeyMapper(s string) string {
 	s = strings.ToLower(strings.TrimPrefix(s, "NOTIFICATION_"))
@@ -85,12 +84,6 @@ func applyDefaults(cfg *Config) {
 	}
 	if cfg.Scheduler.BatchSize <= 0 {
 		cfg.Scheduler.BatchSize = 100
-	}
-	if cfg.UserService.TimeoutSeconds <= 0 {
-		cfg.UserService.TimeoutSeconds = 5
-	}
-	if cfg.UserService.ContactsPathFormat == "" {
-		cfg.UserService.ContactsPathFormat = "/internal/users/%s/notification-contacts"
 	}
 	if cfg.Outbox.BatchSize <= 0 {
 		cfg.Outbox.BatchSize = 50

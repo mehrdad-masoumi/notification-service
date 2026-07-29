@@ -13,22 +13,6 @@ type IFPublisher interface {
 	Ping(ctx context.Context) error
 }
 
-// Contacts is the set of user attributes required to route and personalize
-// a notification. Email/Phone must never be logged.
-type Contacts struct {
-	Email         string
-	Phone         string
-	Locale        string
-	EmailVerified bool
-	PhoneVerified bool
-	Preferences   map[string]bool
-}
-
-//go:generate mockery --name=IFUserContacts --inpackage --filename=mock_user_contacts.go --structname=MockUserContacts
-type IFUserContacts interface {
-	ResolveContacts(ctx context.Context, userID string) (Contacts, error)
-}
-
 type SendRequest struct {
 	NotificationID string
 	DeliveryID     string

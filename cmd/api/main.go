@@ -14,7 +14,6 @@ import (
 	"github.com/mehrdad-masoumi/go-packages/db"
 	"github.com/mehrdad-masoumi/go-packages/httpserver"
 	"notification-service/config"
-	notificationcontract "notification-service/internal/notification/contract"
 	adminhandler "notification-service/internal/notification/http/admin"
 	internalhandler "notification-service/internal/notification/http/internalapi"
 	internalv1handler "notification-service/internal/notification/http/internalapi/v1"
@@ -23,7 +22,6 @@ import (
 	notificationservice "notification-service/internal/notification/service"
 	notificationvalidator "notification-service/internal/notification/validator"
 	"notification-service/internal/scheduler"
-	"notification-service/internal/userclient"
 )
 
 func main() {
@@ -48,9 +46,8 @@ func main() {
 	}
 
 	repo := notificationrepo.New(sqlDB)
-	users := newUserClient(cfg)
 	validator := notificationvalidator.New(cfg.EnabledChannels())
-	svc := notificationservice.New(repo, validator, users)
+	svc := notificationservice.New(repo, validator)
 
 	e := httpserver.NewEcho()
 	httpserver.RegisterMetrics(e)
@@ -96,13 +93,6 @@ func main() {
 	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer shutdownCancel()
 	_ = e.Shutdown(shutdownCtx)
-}
-
-func newUserClient(cfg config.Config) notificationcontract.IFUserContacts {
-	if cfg.UserService.BaseURL == "" {
-		return userclient.Noop{}
-	}
-	return userclient.New(cfg.UserService)
 }
 
 // runIdempotencyCleanupLoop periodically deletes expired idempotency keys

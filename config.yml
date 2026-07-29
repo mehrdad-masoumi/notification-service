@@ -61,12 +61,6 @@ worker:
   max_retries: 5
   health_port: "8081"
 
-user_service:
-  base_url: ""
-  api_key: ""
-  timeout_seconds: 5
-  contacts_path_format: "/internal/users/%s/notification-contacts"
-
 scheduler:
   interval_seconds: 30
   batch_size: 100
