@@ -56,7 +56,7 @@ func TestCreateNotificationBundle_Rollback(t *testing.T) {
 	d := entity.Delivery{ID: uuid.New(), Channel: entity.ChannelInApp, Status: entity.DeliveryPending}
 	// Invalid outbox routing forces failure if validation exists; otherwise
 	// this smoke test asserts the happy path insert succeeds.
-	_, _, err := repo.CreateNotificationBundle(ctx, n, []entity.Delivery{d}, nil)
+	_, _, err := repo.CreateNotificationBundle(ctx, n, []entity.Delivery{d}, nil, nil)
 	require.NoError(t, err)
 
 	got, err := repo.GetByID(ctx, n.ID)
@@ -75,7 +75,7 @@ func TestClaimDelivery_Atomic(t *testing.T) {
 		Channels: []entity.Channel{entity.ChannelInApp}, Locale: "fa",
 	}
 	d := entity.Delivery{ID: uuid.New(), Channel: entity.ChannelInApp, Status: entity.DeliveryPending}
-	_, deliveries, err := repo.CreateNotificationBundle(ctx, n, []entity.Delivery{d}, nil)
+	_, deliveries, err := repo.CreateNotificationBundle(ctx, n, []entity.Delivery{d}, nil, nil)
 	require.NoError(t, err)
 	require.Len(t, deliveries, 1)
 
@@ -118,7 +118,7 @@ func TestUserVisibility_HidesScheduled(t *testing.T) {
 		Channels: []entity.Channel{entity.ChannelInApp}, Locale: "fa", ScheduledAt: &future,
 	}
 	d := entity.Delivery{ID: uuid.New(), Channel: entity.ChannelInApp, Status: entity.DeliveryPending}
-	_, _, err := repo.CreateNotificationBundle(ctx, n, []entity.Delivery{d}, nil)
+	_, _, err := repo.CreateNotificationBundle(ctx, n, []entity.Delivery{d}, nil, nil)
 	require.NoError(t, err)
 
 	items, total, err := repo.ListForUser(ctx, userID, 1, 20)

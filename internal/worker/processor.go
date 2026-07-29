@@ -14,36 +14,40 @@ import (
 	"notification-service/internal/notification/entity"
 	notificationmetrics "notification-service/internal/notification/metrics"
 	notificationrepo "notification-service/internal/notification/repository"
+	notificationservice "notification-service/internal/notification/service"
+	notificationtemplate "notification-service/internal/notification/template"
 	providerrerrors "notification-service/internal/provider"
 	"notification-service/internal/queue"
 	"notification-service/pkg/sharederrors"
 )
 
 type Processor struct {
-	repo       *notificationrepo.Repository
-	registry   notificationcontract.IFProviderRegistry
-	publisher  notificationcontract.IFPublisher
-	maxRetries int
-	dlq        *queue.Client
+	repo        *notificationrepo.Repository
+	registry    notificationcontract.IFProviderRegistry
+	maxRetries  int
+	dlq         *queue.Client
+	baseBackoff time.Duration
+	maxBackoff  time.Duration
 }
 
 func NewProcessor(
 	repo *notificationrepo.Repository,
 	registry notificationcontract.IFProviderRegistry,
-	publisher notificationcontract.IFPublisher,
 	maxRetries int,
 	dlq *queue.Client,
 ) *Processor {
 	return &Processor{
-		repo:       repo,
-		registry:   registry,
-		publisher:  publisher,
-		maxRetries: maxRetries,
-		dlq:        dlq,
+		repo:        repo,
+		registry:    registry,
+		maxRetries:  maxRetries,
+		dlq:         dlq,
+		baseBackoff: time.Second,
+		maxBackoff:  5 * time.Minute,
 	}
 }
 
 func (p *Processor) Handle(ctx context.Context, job notificationdto.QueueJob, attempt int) error {
+	_ = attempt // durable attempt count lives on the delivery row
 	startedAt := time.Now()
 	deliveryID, err := uuid.Parse(job.DeliveryID)
 	if err != nil {
@@ -102,13 +106,23 @@ func (p *Processor) Handle(ctx context.Context, job notificationdto.QueueJob, at
 			return p.failPermanent(ctx, n, delivery, sanitizeErr(resolveErr))
 		}
 		notificationmetrics.ObserveDelivery(string(delivery.Channel), "temporary_error", startedAt)
-		return p.failTemporary(ctx, n, delivery, job, attempt, sanitizeErr(resolveErr))
+		return p.failTemporary(ctx, n, delivery, sanitizeErr(resolveErr))
 	}
 
 	delivery.Provider = provider.Name()
 	if err := p.repo.UpdateDelivery(ctx, delivery); err != nil {
 		notificationmetrics.IncError("update_delivery")
 		return err
+	}
+
+	title, message, renderErr := p.renderForChannel(ctx, n, delivery.Channel)
+	if renderErr != nil {
+		if providerrerrors.IsPermanent(renderErr) {
+			notificationmetrics.ObserveDelivery(string(delivery.Channel), "permanent_error", startedAt)
+			return p.failPermanent(ctx, n, delivery, sanitizeErr(renderErr))
+		}
+		notificationmetrics.ObserveDelivery(string(delivery.Channel), "temporary_error", startedAt)
+		return p.failTemporary(ctx, n, delivery, sanitizeErr(renderErr))
 	}
 
 	actionURL := ""
@@ -127,8 +141,8 @@ func (p *Processor) Handle(ctx context.Context, job notificationdto.QueueJob, at
 		UserID:         n.UserID.String(),
 		Channel:        string(delivery.Channel),
 		To:             to,
-		Title:          n.Title,
-		Message:        n.Message,
+		Title:          title,
+		Message:        message,
 		ActionURL:      actionURL,
 		Payload:        payload,
 	})
@@ -138,7 +152,7 @@ func (p *Processor) Handle(ctx context.Context, job notificationdto.QueueJob, at
 			return p.failPermanent(ctx, n, delivery, sanitizeErr(sendErr))
 		}
 		notificationmetrics.ObserveDelivery(string(delivery.Channel), "temporary_error", startedAt)
-		return p.failTemporary(ctx, n, delivery, job, attempt, sanitizeErr(sendErr))
+		return p.failTemporary(ctx, n, delivery, sanitizeErr(sendErr))
 	}
 
 	now := time.Now().UTC()
@@ -152,6 +166,50 @@ func (p *Processor) Handle(ctx context.Context, job notificationdto.QueueJob, at
 	notificationmetrics.ObserveDelivery(string(delivery.Channel), "success", startedAt)
 	notificationmetrics.IncDelivery(string(delivery.Channel), "success")
 	return p.repo.RecomputeNotificationStatus(ctx, n.ID)
+}
+
+// renderForChannel loads the per-channel template (when template_code is set)
+// and renders subject/body with stored variables. Free-text notifications
+// fall back to the notification's title/message columns.
+func (p *Processor) renderForChannel(ctx context.Context, n entity.Notification, channel entity.Channel) (string, string, error) {
+	if n.TemplateCode == nil || *n.TemplateCode == "" {
+		return n.Title, n.Message, nil
+	}
+
+	var vars map[string]any
+	if len(n.Variables) > 0 {
+		if err := json.Unmarshal(n.Variables, &vars); err != nil {
+			return "", "", providerrerrors.Permanent("invalid notification variables", err)
+		}
+	}
+
+	tmpl, err := p.repo.GetEnabledTemplate(ctx, *n.TemplateCode, n.Locale, string(channel))
+	if err != nil {
+		if errors.Is(err, sharederrors.ErrNotFound) {
+			// Direct commands already render at accept time into title/message;
+			// multi-channel commands should always have a template per channel.
+			if n.Type == "template_direct" {
+				return n.Title, n.Message, nil
+			}
+			notificationmetrics.IncTemplateRenderError(string(channel))
+			return "", "", providerrerrors.Permanent("template not found for channel", err)
+		}
+		return "", "", providerrerrors.Temporary("template lookup failed", err)
+	}
+
+	subject := ""
+	if tmpl.Subject != nil {
+		subject = *tmpl.Subject
+	}
+	renderedSubject, renderedBody, err := notificationtemplate.RenderPair(subject, tmpl.Body, vars)
+	if err != nil {
+		notificationmetrics.IncTemplateRenderError(string(channel))
+		return "", "", providerrerrors.Permanent("template render failed", err)
+	}
+	if renderedSubject == "" {
+		renderedSubject = n.Title
+	}
+	return renderedSubject, renderedBody, nil
 }
 
 func (p *Processor) resolveRecipient(n entity.Notification, channel entity.Channel) (string, error) {
@@ -208,26 +266,44 @@ func (p *Processor) failPermanentClaimed(ctx context.Context, delivery entity.De
 	return p.repo.UpdateDelivery(ctx, delivery)
 }
 
-func (p *Processor) failTemporary(ctx context.Context, n entity.Notification, delivery entity.Delivery, job notificationdto.QueueJob, attempt int, msg string) error {
-	nextAttempt := attempt + 1
+func (p *Processor) failTemporary(ctx context.Context, n entity.Notification, delivery entity.Delivery, msg string) error {
 	delivery.Status = entity.DeliveryFailed
 	delivery.Error = &msg
-	if err := p.repo.UpdateDelivery(ctx, delivery); err != nil {
-		notificationmetrics.IncError("update_delivery")
-		return err
-	}
 
-	if nextAttempt >= p.maxRetries {
+	if delivery.Attempts >= p.maxRetries {
 		return p.failPermanent(ctx, n, delivery, "max retries exceeded: "+msg)
 	}
 
-	job.Attempt = nextAttempt
-	notificationmetrics.IncRetry(string(delivery.Channel), string(n.Priority))
-	notificationmetrics.IncDelivery(string(delivery.Channel), "temporary_failed")
-	if err := p.publisher.Publish(ctx, n.Priority, job); err != nil {
-		notificationmetrics.IncError("retry_publish")
+	delay := notificationservice.Backoff(delivery.Attempts, p.baseBackoff, p.maxBackoff)
+	job := notificationdto.QueueJob{
+		NotificationID: n.ID.String(),
+		DeliveryID:     delivery.ID.String(),
+		Channel:        string(delivery.Channel),
+		Attempt:        delivery.Attempts,
+	}
+	payload, err := json.Marshal(job)
+	if err != nil {
+		notificationmetrics.IncError("retry_marshal")
 		return err
 	}
+
+	event := entity.OutboxEvent{
+		AggregateID: n.ID,
+		DeliveryID:  delivery.ID,
+		EventType:   "notification.delivery.retry",
+		RoutingKey:  "notification." + string(n.Priority),
+		Payload:     payload,
+		Status:      entity.OutboxPending,
+		AvailableAt: time.Now().UTC().Add(delay),
+	}
+
+	if err := p.repo.FailDeliveryAndScheduleRetry(ctx, delivery, event); err != nil {
+		notificationmetrics.IncError("retry_schedule")
+		return err
+	}
+
+	notificationmetrics.IncRetry(string(delivery.Channel), string(n.Priority))
+	notificationmetrics.IncDelivery(string(delivery.Channel), "temporary_failed")
 	return p.repo.RecomputeNotificationStatus(ctx, n.ID)
 }
 

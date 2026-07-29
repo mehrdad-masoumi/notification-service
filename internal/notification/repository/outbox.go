@@ -8,6 +8,7 @@ import (
 	"github.com/google/uuid"
 
 	"notification-service/internal/notification/entity"
+	"notification-service/pkg/sharederrors"
 )
 
 type outboxRow struct {
@@ -129,9 +130,63 @@ func (r *Repository) MarkOutboxPublished(ctx context.Context, id uuid.UUID) erro
 func (r *Repository) MarkOutboxFailed(ctx context.Context, id uuid.UUID, errMsg string, availableAt time.Time) error {
 	_, err := r.db.ExecContext(ctx, `
 		UPDATE notification_outbox
-		SET status = 'failed', last_error = $2, available_at = $3, locked_at = NULL, locked_by = NULL, updated_at = NOW()
+		SET status = 'failed',
+		    attempts = attempts + 1,
+		    last_error = $2,
+		    available_at = $3,
+		    locked_at = NULL,
+		    locked_by = NULL,
+		    updated_at = NOW()
 		WHERE id = $1`, id, errMsg, availableAt)
 	return err
+}
+
+// FailDeliveryAndScheduleRetry marks a delivery failed and writes a delayed
+// outbox retry row in one transaction so neither side can be lost alone.
+func (r *Repository) FailDeliveryAndScheduleRetry(ctx context.Context, d entity.Delivery, event entity.OutboxEvent) error {
+	tx, err := r.db.BeginTxx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	res, err := tx.ExecContext(ctx, `
+		UPDATE notification_deliveries
+		SET provider = $2, status = $3, attempts = $4, error = $5, sent_at = $6, delivered_at = $7, updated_at = NOW()
+		WHERE id = $1`,
+		d.ID, d.Provider, d.Status, d.Attempts, d.Error, d.SentAt, d.DeliveredAt,
+	)
+	if err != nil {
+		return err
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if n == 0 {
+		return sharederrors.ErrNotFound
+	}
+
+	if event.ID == uuid.Nil {
+		event.ID = uuid.New()
+	}
+	if event.Status == "" {
+		event.Status = entity.OutboxPending
+	}
+	if event.AvailableAt.IsZero() {
+		event.AvailableAt = time.Now().UTC()
+	}
+	_, err = tx.ExecContext(ctx, `
+		INSERT INTO notification_outbox (
+			id, aggregate_id, delivery_id, event_type, routing_key, payload, status, available_at
+		) VALUES ($1,$2,$3,$4,$5,$6,$7,$8)`,
+		event.ID, event.AggregateID, event.DeliveryID, event.EventType, event.RoutingKey,
+		event.Payload, event.Status, event.AvailableAt,
+	)
+	if err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 
 // RecoverStuckOutboxLocks resets rows stuck in 'publishing' for longer than

@@ -143,11 +143,9 @@ func (c *Client) SetupTopology() error {
 	return nil
 }
 
-// Publish is a fire-and-forget publish (persistent, non-mandatory). Used by
-// the worker to re-enqueue a job for immediate retry after a temporary
-// failure; delivery is already tracked in Postgres so an occasional lost
-// publish is caught by RecoverStuckSending/outbox reconciliation rather
-// than blocking the retry path on a broker round-trip.
+// Publish is retained for opportunistic paths (e.g. DLQ). Durable delivery
+// and worker retries go through the transactional outbox publisher
+// (PublishWithConfirm) so available_at backoff survives process restarts.
 func (c *Client) Publish(ctx context.Context, priority entity.Priority, job notificationdto.QueueJob) error {
 	body, err := json.Marshal(job)
 	if err != nil {

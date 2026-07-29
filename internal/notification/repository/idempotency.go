@@ -113,10 +113,43 @@ func (r *Repository) ClaimIdempotency(ctx context.Context, key, operation, reque
 	if rec.RequestHash != requestHash {
 		return rec, ClaimConflict, nil
 	}
-	if rec.Status == "processing" {
+	switch rec.Status {
+	case "succeeded":
+		return rec, ClaimReplay, nil
+	case "processing":
+		return rec, ClaimInProgress, nil
+	case "failed":
+		// Prior attempt failed; reclaim so the caller can retry with the
+		// same key+hash. Do not ClaimReplay — failed rows have no response.
+		err = r.db.GetContext(ctx, &row, `
+			UPDATE idempotency_keys
+			SET request_hash = $2, status = 'processing', response_code = NULL, response_body = NULL, updated_at = NOW()
+			WHERE ide_key = $1 AND status = 'failed'
+			RETURNING `+idempotencySelectCols,
+			key, requestHash)
+		if err == nil {
+			return mapIdempotencyRow(row), ClaimAcquired, nil
+		}
+		if !errors.Is(err, sql.ErrNoRows) {
+			return IdempotencyRecord{}, 0, err
+		}
+		// Lost the race; re-classify.
+		err = r.db.GetContext(ctx, &row, `
+			SELECT `+idempotencySelectCols+` FROM idempotency_keys WHERE ide_key = $1`, key)
+		if err != nil {
+			return IdempotencyRecord{}, 0, err
+		}
+		rec = mapIdempotencyRow(row)
+		if rec.RequestHash != requestHash {
+			return rec, ClaimConflict, nil
+		}
+		if rec.Status == "succeeded" {
+			return rec, ClaimReplay, nil
+		}
+		return rec, ClaimInProgress, nil
+	default:
 		return rec, ClaimInProgress, nil
 	}
-	return rec, ClaimReplay, nil
 }
 
 // CompleteIdempotency stores the successful response for later replay.

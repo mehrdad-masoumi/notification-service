@@ -22,7 +22,7 @@ var allEnabled = map[string]bool{
 }
 
 func newTestService() *notificationservice.Service {
-	return notificationservice.New(nil, notificationvalidator.New(allEnabled))
+	return notificationservice.New(nil, notificationvalidator.New(allEnabled), 60)
 }
 
 func TestAdminCreate_ValidationError(t *testing.T) {

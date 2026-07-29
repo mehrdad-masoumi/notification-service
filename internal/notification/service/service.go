@@ -35,15 +35,21 @@ var channelPriorityOrder = []entity.Channel{
 }
 
 type Service struct {
-	repo      *notificationrepo.Repository
-	validator notificationvalidator.Validator
+	repo                  *notificationrepo.Repository
+	validator             notificationvalidator.Validator
+	directRateLimitPerMin int
 }
 
 func New(
 	repo *notificationrepo.Repository,
 	validator notificationvalidator.Validator,
+	directRateLimitPerMin int,
 ) *Service {
-	return &Service{repo: repo, validator: validator}
+	return &Service{
+		repo:                  repo,
+		validator:             validator,
+		directRateLimitPerMin: directRateLimitPerMin,
+	}
 }
 
 func (s *Service) Repo() *notificationrepo.Repository {
@@ -185,7 +191,18 @@ func (s *Service) AcceptCommand(ctx context.Context, req notificationdto.Command
 		}
 	}
 
-	created, _, err := s.repo.CreateNotificationBundle(ctx, n, deliveries, outboxEvents)
+	resp := notificationdto.AcceptedResponse{ID: n.ID.String(), Status: "accepted"}
+	result := "accepted"
+	if scheduled {
+		resp.Status = "scheduled"
+		result = "scheduled"
+	}
+	code := http.StatusAccepted
+	created, _, err := s.repo.CreateNotificationBundle(ctx, n, deliveries, outboxEvents, &notificationrepo.IdempotencyCompletion{
+		Key:  req.IdempotencyKey,
+		Code: code,
+		Body: resp,
+	})
 	if err != nil {
 		_ = s.repo.FailIdempotency(ctx, req.IdempotencyKey)
 		notificationmetrics.IncError("accept_command")
@@ -193,16 +210,8 @@ func (s *Service) AcceptCommand(ctx context.Context, req notificationdto.Command
 		return notificationdto.AcceptedResponse{}, http.StatusInternalServerError, apperr.New(op).WithKind(apperr.KindUnexpected).WithErr(err).WithMessage("failed to create notification")
 	}
 
-	resp := notificationdto.AcceptedResponse{ID: created.ID.String(), Status: "accepted"}
-	result := "accepted"
-	if scheduled {
-		resp.Status = "scheduled"
-		result = "scheduled"
-	}
-	code := http.StatusAccepted
-	_ = s.repo.CompleteIdempotency(ctx, req.IdempotencyKey, code, resp)
 	notificationmetrics.IncCommand("command", string(priority), result)
-	return resp, code, nil
+	return notificationdto.AcceptedResponse{ID: created.ID.String(), Status: resp.Status}, code, nil
 }
 
 // AcceptDirectCommand sends a single-channel notification to an explicit
@@ -226,6 +235,11 @@ func (s *Service) AcceptDirectCommand(ctx context.Context, req notificationdto.D
 	}
 	if resp, code, done, err := s.handleClaimOutcome(rec, outcome, op); done {
 		return resp, code, err
+	}
+
+	if err := s.checkDirectRateLimit(ctx, req.Recipient); err != nil {
+		_ = s.repo.FailIdempotency(ctx, req.IdempotencyKey)
+		return notificationdto.AcceptedResponse{}, http.StatusTooManyRequests, err
 	}
 
 	tmpl, err := s.repo.GetEnabledTemplate(ctx, req.TemplateCode, locale, req.Channel)
@@ -294,7 +308,13 @@ func (s *Service) AcceptDirectCommand(ctx context.Context, req notificationdto.D
 		return notificationdto.AcceptedResponse{}, http.StatusInternalServerError, apperr.New(op).WithKind(apperr.KindUnexpected).WithErr(err)
 	}
 
-	created, _, err := s.repo.CreateNotificationBundle(ctx, n, deliveries, outboxEvents)
+	resp := notificationdto.AcceptedResponse{ID: n.ID.String(), Status: "accepted"}
+	code := http.StatusAccepted
+	created, _, err := s.repo.CreateNotificationBundle(ctx, n, deliveries, outboxEvents, &notificationrepo.IdempotencyCompletion{
+		Key:  req.IdempotencyKey,
+		Code: code,
+		Body: resp,
+	})
 	if err != nil {
 		_ = s.repo.FailIdempotency(ctx, req.IdempotencyKey)
 		notificationmetrics.IncError("accept_direct_command")
@@ -302,11 +322,8 @@ func (s *Service) AcceptDirectCommand(ctx context.Context, req notificationdto.D
 		return notificationdto.AcceptedResponse{}, http.StatusInternalServerError, apperr.New(op).WithKind(apperr.KindUnexpected).WithErr(err).WithMessage("failed to create notification")
 	}
 
-	resp := notificationdto.AcceptedResponse{ID: created.ID.String(), Status: "accepted"}
-	code := http.StatusAccepted
-	_ = s.repo.CompleteIdempotency(ctx, req.IdempotencyKey, code, resp)
 	notificationmetrics.IncCommand("direct_command", string(priority), "accepted")
-	return resp, code, nil
+	return notificationdto.AcceptedResponse{ID: created.ID.String(), Status: "accepted"}, code, nil
 }
 
 // handleClaimOutcome interprets a ClaimIdempotency result. done=true means
@@ -431,7 +448,7 @@ func (s *Service) AdminCreate(ctx context.Context, req notificationdto.AdminCrea
 			}
 		}
 
-		_, _, err = s.repo.CreateNotificationBundle(ctx, n, deliveries, outboxEvents)
+		_, _, err = s.repo.CreateNotificationBundle(ctx, n, deliveries, outboxEvents, nil)
 		if err != nil {
 			notificationmetrics.IncError("admin_create")
 			notificationmetrics.IncAccepted("admin", string(priority), "error")
@@ -540,7 +557,17 @@ func (s *Service) InternalCreate(ctx context.Context, req notificationdto.Intern
 		}
 	}
 
-	created, _, err := s.repo.CreateNotificationBundle(ctx, n, deliveries, outboxEvents)
+	result := "success"
+	resp := notificationdto.AcceptedResponse{ID: n.ID.String(), Status: "accepted"}
+	if scheduled {
+		resp.Status = "scheduled"
+		result = "scheduled"
+	}
+	created, _, err := s.repo.CreateNotificationBundle(ctx, n, deliveries, outboxEvents, &notificationrepo.IdempotencyCompletion{
+		Key:  req.IdempotencyKey,
+		Code: http.StatusAccepted,
+		Body: resp,
+	})
 	if err != nil {
 		_ = s.repo.FailIdempotency(ctx, req.IdempotencyKey)
 		notificationmetrics.IncError("internal_create")
@@ -548,15 +575,8 @@ func (s *Service) InternalCreate(ctx context.Context, req notificationdto.Intern
 		return notificationdto.AcceptedResponse{}, http.StatusInternalServerError, apperr.New(op).WithKind(apperr.KindUnexpected).WithErr(err).WithMessage("failed to create notification")
 	}
 
-	result := "success"
-	resp := notificationdto.AcceptedResponse{ID: created.ID.String(), Status: "accepted"}
-	if scheduled {
-		resp.Status = "scheduled"
-		result = "scheduled"
-	}
 	notificationmetrics.IncAccepted("internal", string(priority), result)
-	_ = s.repo.CompleteIdempotency(ctx, req.IdempotencyKey, http.StatusAccepted, resp)
-	return resp, http.StatusAccepted, nil
+	return notificationdto.AcceptedResponse{ID: created.ID.String(), Status: resp.Status}, http.StatusAccepted, nil
 }
 
 // EnqueueExisting writes any missing outbox rows for a notification's
@@ -1000,6 +1020,24 @@ func (s *Service) AdminSetTemplateStatus(ctx context.Context, id string, enabled
 // ---------------------------------------------------------------------
 // helpers
 // ---------------------------------------------------------------------
+
+func (s *Service) checkDirectRateLimit(ctx context.Context, recipient string) error {
+	const op = "notification_service.checkDirectRateLimit"
+	limit := s.directRateLimitPerMin
+	if limit <= 0 || recipient == "" {
+		return nil
+	}
+	count, err := s.repo.CountRecentDirectByRecipient(ctx, recipient, time.Minute)
+	if err != nil {
+		return apperr.New(op).WithKind(apperr.KindUnexpected).WithErr(err)
+	}
+	if count >= int64(limit) {
+		return apperr.New(op).
+			WithKind(apperr.KindTooManyRequests).
+			WithMessage("direct notification rate limit exceeded")
+	}
+	return nil
+}
 
 func toChannels(in []string) []entity.Channel {
 	out := make([]entity.Channel, 0, len(in))

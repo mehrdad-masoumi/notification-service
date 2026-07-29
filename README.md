@@ -13,22 +13,95 @@ No new consumers, handlers, or domain imports inside this service.
 
 The API never publishes to RabbitMQ. Acceptance is durable: notification + deliveries + outbox rows are written in one Postgres transaction, then `202 Accepted` is returned. A separate **outbox publisher** claims rows with `FOR UPDATE SKIP LOCKED` and publishes with confirms.
 
-```text
-Other microservices
-        │  HTTP (X-Internal-Api-Key)
-        ▼
-Notification API
-  validate → idempotency claim → contacts from request → template render
-        │
-        ▼  single TX
-Postgres: notifications + deliveries + notification_outbox
-        │  202 Accepted
-        ▼
-cmd/outbox  (claim → publish confirms → mark published / backoff retry)
-        ▼
-RabbitMQ  notification.{high,normal,low}  (+ .dlq)
-        ▼
-Workers   atomic delivery claim → providers (in_app / email / sms / …)
+```mermaid
+flowchart TB
+    subgraph callers ["Callers"]
+        otherSvc["Other microservices"]
+        clients["Admin / User clients"]
+    end
+
+    subgraph apiProc ["cmd/api :8080"]
+        httpAPI["HTTP API"]
+        scheduler["Scheduler + cleanup"]
+    end
+
+    subgraph outboxProc ["cmd/outbox :8082"]
+        outboxPub["Outbox publisher"]
+    end
+
+    subgraph workerProc ["cmd/worker :8081"]
+        workers["Workers high / normal / low"]
+    end
+
+    subgraph pg ["PostgreSQL"]
+        notifTables["notifications + deliveries"]
+        outboxTable["notification_outbox"]
+        templates["notification_templates"]
+    end
+
+    subgraph mq ["RabbitMQ"]
+        qHigh["notification.high"]
+        qNormal["notification.normal"]
+        qLow["notification.low"]
+        dlq["*.dlq"]
+    end
+
+    subgraph providers ["Providers"]
+        inApp["in_app"]
+        email["email SMTP"]
+        sms["sms"]
+        whatsapp["whatsapp"]
+        push["push"]
+    end
+
+    otherSvc -->|"POST /internal/v1/* + X-Internal-Api-Key"| httpAPI
+    clients -->|"JWT admin / user routes"| httpAPI
+
+    httpAPI -->|"validate → idempotency → render"| templates
+    httpAPI -->|"single TX → 202 Accepted"| notifTables
+    httpAPI --> outboxTable
+    scheduler --> notifTables
+
+    outboxPub -->|"FOR UPDATE SKIP LOCKED"| outboxTable
+    outboxPub -->|"publish confirms"| qHigh
+    outboxPub --> qNormal
+    outboxPub --> qLow
+
+    qHigh -.-> workers
+    qNormal -.-> workers
+    qLow -.-> workers
+    workers -->|"atomic delivery claim"| notifTables
+    workers --> inApp
+    workers --> email
+    workers --> sms
+    workers --> whatsapp
+    workers --> push
+    workers -.->|"failures"| dlq
+```
+
+```mermaid
+sequenceDiagram
+    participant Caller as Other service
+    participant API as Notification API
+    participant PG as Postgres
+    participant Outbox as cmd/outbox
+    participant RMQ as RabbitMQ
+    participant Worker as cmd/worker
+    participant Prov as Providers
+
+    Caller->>API: POST /internal/v1/notifications
+    API->>API: validate + idempotency claim
+    API->>PG: TX notification + deliveries + outbox
+    API-->>Caller: 202 Accepted
+
+    Outbox->>PG: claim outbox rows
+    Outbox->>RMQ: publish notification.priority
+    Outbox->>PG: mark published / backoff
+
+    Worker->>RMQ: consume
+    Worker->>PG: claim delivery
+    Worker->>Prov: send channel
+    Worker->>PG: mark sent / retry / DLQ
 ```
 
 - Templates live in `notification_templates` (`{{amount}}`-style placeholders only; no code execution).
